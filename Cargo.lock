@@ -164,7 +164,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tell"
+name = "synctell"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -13,10 +13,10 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(
-    name = "tell",
+    name = "synctell",
     version,
     about = "Instantly create and use FIFO special files",
-    long_about = "tell creates and interacts with FIFO (named pipe) special files.\n\n\
+    long_about = "synctell creates and interacts with FIFO (named pipe) special files.\n\n\
                   Output mode (-o): creates a FIFO and writes a message (or stdin) to it.\n\
                   Input mode (-i): reads from an existing FIFO and writes to stdout."
 )]
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
         (None, Some(path)) => cmd_input(&path),
         _ => {
             eprintln!("error: exactly one of -o or -i must be specified");
-            eprintln!("try 'tell --help' for more information");
+            eprintln!("try 'synctell --help' for more information");
             std::process::exit(1);
         }
     }
