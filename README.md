@@ -70,7 +70,7 @@ behavior is not a limitation; it is the feature.
 
 FIFOs are a natural fit for **AI agent-to-agent communication**. In a
 multi-agent system, agents need a way to exchange messages, coordinate work,
-and synchronize without a central broker. `tell` makes this trivial.
+and synchronize without a central broker. `synctell` makes this trivial.
 
 ### The pattern
 
@@ -94,7 +94,7 @@ synctell -i agent-b/inbox.fifo
 
 ### Why this works so well for agents
 
-**1. Blocking is synchronization.** When Agent B runs `tell -i inbox.fifo`,
+**1. Blocking is synchronization.** When Agent B runs `synctell -i inbox.fifo`,
 it hangs — blocks — until Agent A writes. No polling, no busy-waiting, no
 wasted CPU. The OS handles the rendezvous. This is a **semaphore**: the
 reader cannot proceed until a message arrives.
