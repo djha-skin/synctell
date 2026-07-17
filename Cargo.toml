@@ -2,6 +2,11 @@
 name = "synctell"
 version = "0.1.0"
 edition = "2024"
+description = "Instantly create and use FIFO special files for inter-process and AI agent communication"
+license = "MIT"
+repository = "https://github.com/djha-skin/synctell"
+homepage = "https://github.com/djha-skin/synctell"
+documentation = "https://github.com/djha-skin/synctell"
 
 [dependencies]
 anyhow = "1"
