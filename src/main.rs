@@ -18,19 +18,23 @@ use clap::Parser;
     about = "Instantly create and use FIFO special files",
     long_about = "synctell creates and interacts with FIFO (named pipe) special files.\n\n\
                   Output mode (-o): creates a FIFO and writes a message (or stdin) to it.\n\
-                  Input mode (-i): reads from an existing FIFO and writes to stdout."
+                  Input mode (-i): polls for the existence of a file and reads it.\n\n\
+                  Output mode creates a FIFO automatically and removes it after use.\n\
+                  Input mode does not create anything; it polls the filesystem for\n\
+                  the target file every second.  Use -t to set a timeout.\n\
+                  Without -t, input exits immediately if the file is absent."
 )]
 struct Cli {
     /// Create a FIFO at FILE and write to it
     #[arg(short = 'o', long = "output", value_name = "FILE", conflicts_with = "input")]
     output: Option<PathBuf>,
 
-    /// Read from an existing FIFO at FILE and write to stdout
+    /// Poll for FILE and read its contents once it appears
     #[arg(short = 'i', long = "input", value_name = "FILE", conflicts_with = "output")]
     input: Option<PathBuf>,
 
-    /// Seconds to wait for a reader before timing out (output mode only)
-    #[arg(short = 't', long = "timeout", value_name = "SECS", conflicts_with = "input")]
+    /// Seconds to wait for FILE to appear before timing out (input mode)
+    #[arg(short = 't', long = "timeout", value_name = "SECS")]
     timeout: Option<u64>,
 
     /// Message to write to the FIFO (if omitted, reads from stdin)
@@ -42,7 +46,7 @@ fn main() -> Result<()> {
 
     match (cli.output, cli.input) {
         (Some(path), None) => cmd_output(&path, cli.message.as_deref(), cli.timeout),
-        (None, Some(path)) => cmd_input(&path),
+        (None, Some(path)) => cmd_input(&path, cli.timeout),
         _ => {
             eprintln!("error: exactly one of -o or -i must be specified");
             eprintln!("try 'synctell --help' for more information");
@@ -50,6 +54,8 @@ fn main() -> Result<()> {
         }
     }
 }
+
+// ─── Output mode ───────────────────────────────────────────────────
 
 /// Output mode: create a FIFO and write data to it.
 ///
@@ -150,25 +156,61 @@ fn cmd_output_with_timeout(
     result.context(format!("failed to write to '{path_display}'"))
 }
 
-/// Input mode: verify the path is a FIFO, then stream it to stdout.
-fn cmd_input(path: &PathBuf) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("'{}' does not exist or is not accessible", path.display()))?;
+// ─── Input mode ────────────────────────────────────────────────────
 
-    if !metadata.file_type().is_fifo() {
-        let kind = if metadata.file_type().is_dir() {
-            "directory"
-        } else if metadata.file_type().is_file() {
-            "regular file"
-        } else {
-            "other special file"
-        };
-        anyhow::bail!("'{}' exists but is not a FIFO (it is a {kind})", path.display());
+/// Input mode: poll for the existence of a file and read it.
+///
+/// Does **not** create anything — the file (typically a FIFO created
+/// by a concurrent `-o` invocation) must already exist on disk.
+///
+/// - Without a timeout, exits immediately with code 1 if the file is
+///   not already present.
+/// - With a timeout, polls once per second.  If the file appears, it
+///   is read and its contents are written to stdout.  If the timeout
+///   elapses first the process exits with code 124.
+fn cmd_input(path: &PathBuf, timeout: Option<u64>) -> Result<()> {
+    let path_display = path.display().to_string();
+
+    match timeout {
+        Some(secs) => cmd_input_poll(path, secs, &path_display),
+        None => {
+            // No timeout — file must already exist or we bail out.
+            if !path.exists() {
+                eprintln!("error: '{path_display}' does not exist");
+                std::process::exit(1);
+            }
+            read_and_stream(path, &path_display)
+        }
+    }
+}
+
+/// Poll for file existence every second, then read it.
+///
+/// Checks immediately, then sleeps 1 s between subsequent checks.
+/// The total elapsed time is approximately `secs` seconds.
+/// If the file has not appeared by then, exit with code 124.
+fn cmd_input_poll(path: &PathBuf, secs: u64, path_display: &str) -> Result<()> {
+    for i in 0..=secs {
+        if path.exists() {
+            return read_and_stream(path, path_display);
+        }
+        // Sleep between checks, but not after the very last one.
+        if i < secs {
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 
-    // Open for reading.  Blocks until a writer opens the other end.
+    eprintln!(
+        "error: timed out waiting for '{path_display}' to appear"
+    );
+    std::process::exit(124);
+}
+
+/// Open an existing file (FIFO or regular) and stream its contents
+/// to stdout.
+fn read_and_stream(path: &PathBuf, path_display: &str) -> Result<()> {
     let mut file = fs::File::open(path)
-        .with_context(|| format!("failed to open '{}' for reading", path.display()))?;
+        .with_context(|| format!("failed to open '{path_display}' for reading"))?;
 
     let mut stdout = io::stdout().lock();
     let mut buf = [0u8; 8192];
@@ -176,7 +218,7 @@ fn cmd_input(path: &PathBuf) -> Result<()> {
     loop {
         let n = file
             .read(&mut buf)
-            .context("failed to read from FIFO")?;
+            .context(format!("failed to read from '{path_display}'"))?;
         if n == 0 {
             break;
         }
@@ -187,6 +229,8 @@ fn cmd_input(path: &PathBuf) -> Result<()> {
 
     Ok(())
 }
+
+// ─── FIFO creation ─────────────────────────────────────────────────
 
 /// Create a POSIX FIFO at `path` with mode 0666 (umask-applied).
 ///

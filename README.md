@@ -4,6 +4,9 @@ A command-line utility for instant FIFO (named pipe) creation and communication.
 `synctell` creates and interacts with POSIX FIFO special files, providing a
 dead-simple, infrastructure-free interface for inter-process messaging.
 
+Both output (`-o`) and input (`-i`) modes **create the FIFO automatically** and
+**remove it when done**. You never need to manage FIFO lifecycle by hand.
+
 ## Installation
 
 ```bash
@@ -13,52 +16,58 @@ cargo install synctell
 ## Usage
 
 ```bash
-# Write a message into a FIFO (creates it automatically)
+# Write a message into a FIFO (creates it, blocks until reader connects, then removes it)
 synctell -o my-fifo "hello, world"
 
 # Write stdin into a FIFO
 echo "hello" | synctell -o my-fifo
 
-# Read from a FIFO (must already exist and be a FIFO)
+# Read from a FIFO (creates it, blocks until writer connects, then removes it)
 synctell -i my-fifo
 
 # Write with a timeout — exit 124 if no reader connects in 5 seconds
 synctell -o my-fifo -t 5 "important message"
+
+# Read with a timeout — exit 124 if no writer connects in 5 seconds
+synctell -i my-fifo -t 5
 ```
 
 ## Examples
 
 ### Pipe between two shells
 
-The writer must start first — it creates the FIFO and blocks until a reader
-connects:
+Both sides create the FIFO — whichever side runs first will create it, and
+the second side finds it already exists (this is harmless).  The writer
+blocks until a reader connects; the reader blocks until a writer connects.
 
-**Shell 1** (writer — start this first):
+**Shell 1** (writer):
 ```bash
 synctell -o my-fifo "the answer is 42"
 ```
 
-The writer blocks, waiting for a reader. Now start the reader:
-
-**Shell 2** (reader — start this second):
+**Shell 2** (reader):
 ```bash
 synctell -i my-fifo
 ```
 
 Shell 2 prints `the answer is 42` and both shells return. The FIFO is
-automatically removed after the write completes.
+automatically removed after the exchange completes.
 
 ### With a timeout
 
 ```bash
-# This will exit 124 after 3 seconds if nobody reads
+# Exit 124 after 3 seconds if no reader appears
 synctell -o my-fifo -t 3 "are you there?"
+
+# Exit 124 after 3 seconds if no writer appears
+synctell -i my-fifo -t 3
 ```
 
 ### Chaining with other tools
 
-Start the writer in the background so it creates the FIFO and blocks, then
-run the reader in the foreground:
+Since both `-o` and `-i` create the FIFO, you can start either side first.
+The first side to run creates the FIFO and blocks; the second side finds
+it already exists and connects immediately:
 
 ```bash
 # Writer: buffer stdin into a FIFO (runs in background, blocks until reader connects)
@@ -93,18 +102,19 @@ agent-a/               agent-b/
   outbox.fifo            inbox.fifo
 ```
 
-Agent A sends a message to Agent B. The writer creates the FIFO and blocks
+Agent A sends a message to Agent B.  Agent A creates the FIFO and blocks
 until Agent B reads:
 
 ```bash
-# Agent A — writer (starts first, creates FIFO, blocks until reader connects)
+# Agent A — writer (creates FIFO, blocks until reader connects)
 synctell -o agent-b/inbox.fifo "task complete: step 3 done"
 ```
 
-Agent B picks up the message:
+Agent B picks up the message.  It also creates the FIFO (harmless if
+Agent A already created it), then blocks until the writer connects:
 
 ```bash
-# Agent B — reader (starts second, opens existing FIFO)
+# Agent B — reader (creates FIFO, blocks until writer connects)
 synctell -i agent-b/inbox.fifo
 # prints: task complete: step 3 done
 ```
@@ -114,11 +124,11 @@ synctell -i agent-b/inbox.fifo
 **1. Blocking is synchronization.** When Agent A runs `synctell -o inbox.fifo "message"`,
 it creates the FIFO and then **blocks** — hangs — until Agent B opens the
 other end with `synctell -i inbox.fifo`. No polling, no busy-waiting, no
-wasted CPU. The OS handles the rendezvous. The writer cannot proceed until
-the reader connects, providing natural flow control.
+wasted CPU. The OS handles the rendezvous. Neither side can proceed until
+the other connects, providing natural flow control.
 
 **2. One-shot message passing.** Each FIFO carries exactly one message. The
-writer creates the FIFO, writes, and removes it. This eliminates
+side that finishes first removes the FIFO. This eliminates
 complexities of shared state, message queues, or buffer management. If
 Agent A needs to send another message, it creates a new FIFO. Simple and
 predictable.
@@ -128,19 +138,19 @@ configure. No network socket to bind. A FIFO is a file. It lives in the
 filesystem, visible to every agent that has directory access. You can `ls`
 it, `stat` it, `rm` it. It is as simple as messaging gets.
 
-**4. Predictable lifecycle.** The FIFO's existence signals that a message is
-incoming. Once the writer creates it, it exists until the write completes
-and `synctell` removes it. Agents can coordinate by agreeing on FIFO
-paths — the path itself is the protocol.
+**4. Predictable lifecycle.** Both `-o` and `-i` create the FIFO, so either
+agent can start first. After the exchange, the FIFO is removed automatically.
+Agents can coordinate by agreeing on FIFO paths — the path itself is the
+protocol.
 
 **5. Timeout for liveness.** Use `-t` to avoid deadlocks. If the expected
-reader never shows up, `synctell` exits with code 124 instead of hanging
+peer never shows up, `synctell` exits with code 124 instead of hanging
 forever. Your orchestration layer can detect this and re-route work.
 
 ### Example: multi-agent pipeline
 
-Each step creates a one-shot FIFO for the next. The writer must start first —
-it creates the FIFO and blocks until the reader connects:
+Each step creates a one-shot FIFO for the next. Either side can start first
+since both `-o` and `-i` create the FIFO automatically:
 
 ```bash
 # Step 1 → Step 2: Agent A sends a message, Agent B receives it
@@ -154,9 +164,9 @@ synctell -i pipeline/step3-input.fifo | send-to-storage
 wait
 ```
 
-Each `-o` creates a FIFO, writes, and removes it. Each `-i` reads from an
-existing FIFO and streams to stdout. Run the writer (background) before the
-reader (foreground) so the FIFO exists when the reader checks for it.
+Each `-o` creates a FIFO, writes, and removes it. Each `-i` creates a FIFO,
+reads, and removes it. The background side blocks until the foreground side
+connects.
 
 ## How It Works
 
@@ -176,9 +186,9 @@ handle the blocking FIFO open, while the main thread waits with a deadline.
 If the deadline expires, the FIFO is cleaned up and the process exits with
 code **124**.
 
-After a successful write, `synctell` removes the FIFO from the filesystem,
-keeping your working directory clean. Each `-o` call is one-shot: create,
-write, remove.
+After a successful exchange, `synctell` removes the FIFO from the filesystem,
+keeping your working directory clean. Each invocation is one-shot: create,
+exchange, remove.
 
 ## Exit Codes
 
@@ -186,7 +196,7 @@ write, remove.
 |------|---------|
 | 0    | Success |
 | 1    | General error (missing arguments, write failure, etc.) |
-| 124  | Timeout — no reader connected within the specified duration |
+| 124  | Timeout — no peer connected within the specified duration |
 
 ## License
 
