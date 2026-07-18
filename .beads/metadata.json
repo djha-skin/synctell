@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "synctell",
+  "project_id": "782a88a1-9991-4276-a154-dd526860e432"
+}
