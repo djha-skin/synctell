@@ -4,9 +4,9 @@ A command-line utility for instant FIFO (named pipe) creation and communication.
 `synctell` creates and interacts with POSIX FIFO special files, providing a
 dead-simple, infrastructure-free interface for inter-process messaging.
 
-**Writers (`-o`) create the FIFO and clean it up when done.**  
-**Readers (`-i`) poll for the FIFO and stream it to stdout.**  
-You never need to manage FIFO lifecycle by hand.
+Writers (`-o`) create the FIFO and clean it up when done. Readers (`-i`) poll
+for the FIFO and stream it to stdout. You never need to manage FIFO lifecycle by
+hand.
 
 ## Installation
 
