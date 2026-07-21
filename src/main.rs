@@ -33,6 +33,8 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
                   Output mode (-o): polls for a FIFO and writes a message to it.\n\n\
                   Input mode creates a FIFO automatically and stays alive,\n\
                   reading messages from one or more writers until interrupted.\n\
+                  Without --linger, the reader exits after the first message.\n\
+                  With --linger, it stays alive for more writers until interrupted.\n\
                   Its presence on disk signals that a reader is listening.\n\
                   The FIFO is removed when the reader exits.\n\n\
                   Output mode does not create anything; it polls the filesystem for\n\
@@ -47,6 +49,10 @@ struct Cli {
     /// Create a FIFO at FILE and read from it
     #[arg(short = 'i', long = "input", value_name = "FILE", conflicts_with = "output")]
     input: Option<PathBuf>,
+
+    /// Keep reading after the first message (only with -i)
+    #[arg(short = 'l', long = "linger", conflicts_with = "output")]
+    linger: bool,
 
     /// Seconds to wait before timing out
     #[arg(short = 't', long = "timeout", value_name = "SECS")]
@@ -67,7 +73,7 @@ fn main() -> Result<()> {
 
     match (cli.output, cli.input) {
         (Some(path), None) => cmd_output(&path, cli.message.as_deref(), cli.timeout),
-        (None, Some(path)) => cmd_input(&path, cli.timeout),
+        (None, Some(path)) => cmd_input(&path, cli.timeout, cli.linger),
         _ => {
             eprintln!("error: exactly one of -o or -i must be specified");
             eprintln!("try 'synctell --help' for more information");
@@ -195,21 +201,22 @@ enum ReadResult {
 
 /// Input mode: create a FIFO and read messages from writers.
 ///
-/// Creates a FIFO at `path`, then stays alive reading messages from
-/// one or more writers.  The FIFO's presence on disk signals that a
-/// reader is listening.
+/// Creates a FIFO at `path` and reads from it.
+/// The FIFO's presence on disk signals that a reader is listening.
+///
+/// - Without `--linger`, reads one message then exits.
+/// - With `--linger`, stays alive reading from one or more writers
+///   until interrupted by a signal.
 ///
 /// - Without a timeout, blocks until a writer appears.
 /// - With a timeout, waits at most `secs` seconds for the first
-///   writer.  Once at least one writer has connected, the reader
-///   stays alive indefinitely.
+///   writer.  If no writer connects in time, exits with code 124.
 ///
-/// After each message, the reader waits for the next writer.
 /// Each message is line-framed on stdout: if the writer's bytes do
 /// not end with `'\n'`, the reader appends one.  This makes
 /// many-writer output cleanly line-separated.
-/// The FIFO is removed when the process receives SIGINT or SIGTERM.
-fn cmd_input(path: &Path, timeout: Option<u64>) -> Result<()> {
+/// The FIFO is removed on exit.
+fn cmd_input(path: &Path, timeout: Option<u64>, linger: bool) -> Result<()> {
     let path_display = path.display().to_string();
 
     // Reader creates the FIFO — its presence signals "someone is listening".
@@ -231,8 +238,11 @@ fn cmd_input(path: &Path, timeout: Option<u64>) -> Result<()> {
                         .write_all(b"\n")
                         .context("failed to write to stdout")?;
                 }
+                if !linger {
+                    break;
+                }
                 // After the first successful read, remove the timeout.
-                // The reader persists until interrupted.
+                // The reader persists until interrupted (linger mode).
                 deadline = None;
             }
             ReadResult::TimedOut => {
