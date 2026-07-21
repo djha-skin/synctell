@@ -7,8 +7,8 @@ dead-simple, infrastructure-free interface for inter-process messaging.
 Readers (`-i`) create the FIFO and clean it up when done. Writers (`-o`) poll
 for the FIFO and stream data into it. You never need to manage FIFO lifecycle
 by hand. Because readers create the FIFOs, multiple writers can write to the
-same reader — and the FIFO's presence on disk is a clean signal that *someone
-is listening*, which is more useful than "someone wants to say something."
+same reader -- and the FIFO's presence on disk is a clean signal that someone
+is listening for a message.
 
 ## Installation
 
