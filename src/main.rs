@@ -31,8 +31,7 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
     long_about = "synctell creates and interacts with FIFO (named pipe) special files.\n\n\
                   Input mode (-i): creates a FIFO and reads messages from writers.\n\
                   Output mode (-o): polls for a FIFO and writes a message to it.\n\n\
-                  Input mode creates a FIFO automatically and stays alive,\n\
-                  reading messages from one or more writers until interrupted.\n\
+                  Input mode creates a FIFO and reads messages from writers.\n\
                   Without --linger, the reader exits after the first message.\n\
                   With --linger, it stays alive for more writers until interrupted.\n\
                   Its presence on disk signals that a reader is listening.\n\

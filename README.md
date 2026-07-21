@@ -19,8 +19,11 @@ cargo install synctell
 ## Usage
 
 ```bash
-# Read from a FIFO (creates it, blocks until writers connect, removes it on exit)
+# Read a single message from a FIFO (creates it, reads one message, exits)
 synctell -i my-fifo
+
+# Read many messages — stay alive for multiple writers until SIGINT
+synctell -l -i my-fifo
 
 # Write a message into a FIFO (waits for a reader to appear, writes, then exits)
 synctell -o my-fifo "hello, world"
@@ -39,10 +42,8 @@ synctell -i my-fifo -t 5
 
 ### Pipe between two shells
 
-The reader (`-i`) creates the FIFO and stays alive, accepting one message
-per writer connection. The writer (`-o`) waits for the FIFO to appear, opens
-it, writes, and exits. Send SIGINT (Ctrl-C) or SIGTERM to the reader to
-shut down cleanly — the FIFO is removed automatically.
+The reader (`-i`) creates the FIFO and reads one message, then exits.
+The writer (`-o`) waits for the FIFO to appear, opens it, writes, and exits.
 
 **Shell 1** (reader — start this first, or concurrently with `-t` on the
 writer):
@@ -55,9 +56,14 @@ synctell -i my-fifo
 synctell -o my-fifo "the answer is 42"
 ```
 
-Shell 1 prints `the answer is 42`. The writer exits as soon as its message
-is delivered. The reader stays alive, ready for more writers. Send it
-SIGINT (Ctrl-C) or SIGTERM when you're done, and the FIFO is removed.
+Shell 1 prints `the answer is 42` and exits. The writer exits as soon as its
+message is delivered.
+
+To accept **multiple** messages from different writers, add `-l`:
+
+```bash
+synctell -l -i my-fifo
+```
 
 > **Note:** Without a timeout (`-t`), the writer exits immediately with
 > code 1 if the FIFO is not yet present. If you're unsure which side
@@ -73,21 +79,25 @@ SIGINT (Ctrl-C) or SIGTERM when you're done, and the FIFO is removed.
 # Writer: exit 124 after 3 seconds if no reader is listening
 synctell -o my-fifo -t 3 "are you there?"
 
-# Reader: exit 124 after 3 seconds if no writer shows up.  Once one writer
-# has connected, the reader stays alive indefinitely.
+# Reader: exit 124 after 3 seconds if no writer shows up.
+# Without -l, exits after the first message.
 synctell -i my-fifo -t 3
+
+# Reader (linger mode): exit 124 after 3 seconds if no writer shows up.
+# Once one writer has connected, the reader stays alive indefinitely.
+synctell -l -i my-fifo -t 3
 ```
 
 ### Multiple writers, one reader
 
-A single reader accepts messages from any number of writers. Each message
-arrives as a separate chunk on the reader's stdout. If a writer's data
-doesn't end with a newline, the reader appends one — so writers that send
-plain messages line up neatly on the receiver's output:
+A single reader with `-l` accepts messages from any number of writers.
+Each message arrives as a separate chunk on the reader's stdout. If a
+writer's data doesn't end with a newline, the reader appends one — so
+writers that send plain messages line up neatly on the receiver's output:
 
 ```bash
-# Terminal 1: one reader, listening
-synctell -i inbox.fifo
+# Terminal 1: one reader, listening until interrupted
+synctell -l -i inbox.fifo
 
 # Terminal 2, 3, 4: many writers, each delivering a message
 synctell -o inbox.fifo "from agent-a"
@@ -116,7 +126,7 @@ Start the writer in the background — it waits for the FIFO to appear
 cat big-file.csv | synctell -o data-pipe &
 
 # Reader: creates the FIFO, consumes stdin from each writer, streams to stdout
-synctell -i data-pipe | sort | uniq -c > result.txt
+synctell -l -i data-pipe | sort | uniq -c > result.txt
 
 wait
 ```
@@ -164,7 +174,7 @@ deliver to existing FIFOs. This has two useful properties:
 
 ```bash
 # Agent B — reader (creates inbox.fifo, listens for messages)
-synctell -i agent-b/inbox.fifo
+synctell -l -i agent-b/inbox.fifo
 ```
 
 ```bash
@@ -181,8 +191,7 @@ The reader prints `task complete: step 3 done` and continues listening.
 until the FIFO appears (or its `-t` timeout expires). The writer cannot
 deliver until the reader has created the FIFO, providing natural flow
 control. No busy-waiting, no wasted CPU. The OS handles the rendezvous.
-On the reader side, the signal-driven poll interval (1 second by default)
-keeps overhead minimal.
+On the reader side, the 1-second poll interval keeps overhead minimal.
 
 **2. Many-to-one messaging.** A single reader can accept messages from
 any number of writers. Each writer connects, writes, and disconnects;
@@ -201,9 +210,10 @@ filesystem, visible to every agent that has directory access. You can
 `ls` it, `stat` it, `rm` it. It is as simple as messaging gets.
 
 **5. Predictable lifecycle.** The reader creates the FIFO, accepts
-messages, and removes the FIFO when it exits. Writers poll for the FIFO,
-write, and exit. Agents can coordinate by agreeing on FIFO paths — the
-path itself is the protocol.
+messages, and removes the FIFO when it exits. With `-l`, it stays alive
+for multiple writers; without `-l`, it exits after the first message.
+Writers poll for the FIFO, write, and exit. Agents can coordinate by
+agreeing on FIFO paths — the path itself is the protocol.
 
 **6. Timeout for liveness.** Use `-t` to avoid deadlocks. If the expected
 peer never shows up, `synctell` exits with code 124 instead of hanging
@@ -225,7 +235,9 @@ synctell -i pipeline/step3-input.fifo | send-to-storage
 wait
 ```
 
-Each `-i` creates a FIFO, reads its input, removes the FIFO on exit.
+Each `-i` creates a FIFO, reads input, and removes the FIFO on exit.
+With `-l`, a reader stays alive for multiple writers; without `-l`,
+it exits after the first message.
 Each `-o` polls for the FIFO, writes, exits. The polling writer blocks
 until the upstream reader has created the FIFO, providing natural
 backpressure between stages.
@@ -236,7 +248,7 @@ Many agents reporting into a single observer:
 
 ```bash
 # Observer: one reader, accepts reports from any number of agents
-synctell -i reports.fifo | tee -a /var/log/agents.log &
+synctell -l -i reports.fifo | tee -a /var/log/agents.log &
 ```
 
 ```bash
@@ -250,6 +262,9 @@ The observer's log grows line by line, with each report arriving as
 soon as its writer connects. No need for a broker, a log-collector
 daemon, or a network socket — just a FIFO.
 
+> **Note:** Without `-l`, the reader exits after the first report.
+> Use `-l` when you expect multiple writers to report over time.
+
 ## How It Works
 
 `synctell` uses the `mkfifo(3)` system call to create POSIX named pipes
@@ -258,12 +273,15 @@ blocks until a reader opens the other end, and vice versa) provide
 natural synchronization without additional coordination.
 
 In input mode (`-i`), `synctell` calls `mkfifo(3)` once at startup, then
-loops reading messages: for each iteration it blocks on `open(path)` for
+reads messages. For each iteration it blocks on `open(path)` for
 reading, which returns only once a writer has connected; it reads the
 message to EOF, writes the bytes (plus a trailing newline if the writer's
-data didn't already end with one) to stdout, and goes back to waiting
-for the next writer. This continues until a SIGINT or SIGTERM sets a
-shutdown flag that the read loop checks once per second.
+data didn't already end with one) to stdout, and then:
+
+- **Without `-l`** (default): exits after the first message.
+- **With `-l`**: goes back to waiting for the next writer, discarding any
+  timeout. This continues until a SIGINT or SIGTERM sets a shutdown flag
+  that the read loop checks once per second.
 
 In output mode (`-o`), `synctell` first buffers all of stdin (if no
 positional message is given) into memory **before** opening the FIFO.
@@ -275,9 +293,9 @@ When a timeout is specified (`-t`), output mode polls once per second
 for the FIFO's existence. If the FIFO has not appeared by the deadline,
 the process exits with code **124**. Input mode, on timeout without any
 writer ever connecting, also removes the FIFO it created and exits with
-code **124**. Once a reader has received at least one message, it stays
-alive indefinitely — the timeout only governs the wait for the *first*
-writer.
+code **124**. In linger mode (`-l`), once a reader has received at least
+one message, it stays alive indefinitely — the timeout only governs the
+wait for the *first* writer.
 
 The reader removes the FIFO from the filesystem when it exits (whether
 cleanly via SIGINT/SIGTERM or by timeout). Each `-i` invocation owns
