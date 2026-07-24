@@ -301,6 +301,65 @@ The reader removes the FIFO from the filesystem when it exits (whether
 cleanly via SIGINT/SIGTERM or by timeout). Each `-i` invocation owns
 its FIFO for its entire lifetime; writers come and go freely.
 
+## MCP Server
+
+`synctell` includes a built-in MCP (Model Context Protocol) server that
+exposes its FIFO operations as tools over JSON-RPC on stdio. This lets
+AI agents — or any MCP-compatible host — create, read, and write FIFOs
+programmatically.
+
+### Starting the server
+
+```bash
+synctell mcp
+```
+
+The server speaks the MCP protocol on stdin/stdout. It is designed to be
+launched by an MCP host (such as a goose session or any MCP-capable
+agent framework).
+
+### Available tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `synctell_write` | Write a message to a FIFO | `path` (string), `message` (string) |
+| `synctell_read_oneshot` | Create a FIFO, read one message, remove FIFO | `path` (string), `timeout` (integer, optional, 0 = block forever) |
+| `synctell_read_start_linger` | Create a FIFO, start a background reader accepting multiple writers | `path` (string), `timeout` (integer, optional, accepted but not yet enforced) |
+| `synctell_read_stop_linger` | Stop a lingering reader, return buffered data | `path` (string) |
+
+### Timeout semantics
+
+The `timeout` parameter on `synctell_read_oneshot` accepts a non-negative
+integer in seconds. A value of `0` (the default) means **block forever**
+— the tool waits indefinitely for a peer. A positive value means "return
+an error if no peer appears within N seconds."
+
+> **Note:** The `timeout` parameter on `synctell_read_start_linger` is
+> accepted for forward compatibility but is not yet enforced. The linger
+> reader always blocks until a writer connects or the reader is stopped.
+
+### Example: configuring in a goose session
+
+```yaml
+extensions:
+  synctell:
+    name: synctell
+    command: synctell mcp
+```
+
+### Lifecycle
+
+1. Call `synctell_read_start_linger` (or `synctell_read_oneshot`) to
+   create a FIFO and start listening.
+2. The FIFO's presence on disk signals that a reader is active.
+3. Call `synctell_write` to deliver messages to the FIFO.
+4. For linger mode, call `synctell_read_stop_linger` to collect all
+   buffered messages and clean up.
+
+For one-shot communication, `synctell_read_oneshot` handles the full
+lifecycle: create FIFO → read one message → remove FIFO — in a single
+call.
+
 ## Exit Codes
 
 | Code | Meaning |

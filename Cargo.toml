@@ -1,6 +1,6 @@
 [package]
 name = "synctell"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Instantly create and use FIFO special files for inter-process and AI agent communication"
 license = "MIT"

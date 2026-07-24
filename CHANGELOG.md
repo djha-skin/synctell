@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.3.0] — 2026-07-23
+
+### Added
+
+- MCP server (`synctell mcp`): built-in JSON-RPC server exposing four FIFO
+  tools for AI agent and programmatic use. Tools: `synctell_write`,
+  `synctell_read_oneshot`, `synctell_read_start_linger`,
+  `synctell_read_stop_linger`.
+- Integration tests for all MCP tools.
+
+### Fixed
+
+- Linger reader deadlock during MCP implementation.
+- MCP `timeout` parameter: changed from `Option<u64>` to `u64` with
+  `#[serde(default)]` to fix JSON schema union type (`["integer", "null"]`)
+  that some MCP bridges could not serialize. Convention: `0` = block forever,
+  `>0` = timeout after N seconds.
+
 ## [0.2.0] — 2026-07-21
 
 ### Added
