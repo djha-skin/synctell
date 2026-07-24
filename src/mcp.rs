@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_router, ServerHandler, ServiceExt};
+use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 
 // ─── Request schemas ───────────────────────────────────────────────
@@ -91,8 +91,15 @@ impl SynctellServer {
         &self,
         Parameters(StartLingerRequest { path, timeout }): Parameters<StartLingerRequest>,
     ) -> Result<String, String> {
+        let mut readers = self.readers.lock().unwrap();
+        if readers.contains_key(&path) {
+            return Err(format!(
+                "linger reader already active for '{}'",
+                path.display()
+            ));
+        }
         let reader = start_linger(&path, timeout)?;
-        self.readers.lock().unwrap().insert(path.clone(), reader);
+        readers.insert(path.clone(), reader);
         Ok(format!("linger reader started at '{}'", path.display()))
     }
 
@@ -112,6 +119,7 @@ impl SynctellServer {
     }
 }
 
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for SynctellServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
