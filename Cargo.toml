@@ -12,3 +12,11 @@ documentation = "https://github.com/djha-skin/synctell"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+rmcp = { version = "2.2.0", features = ["server", "macros", "schemars", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

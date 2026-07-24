@@ -9,8 +9,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod mcp;
+
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 /// Flag set by signal handler to request graceful shutdown.
 static QUIT: AtomicBool = AtomicBool::new(false);
@@ -59,6 +61,15 @@ struct Cli {
 
     /// Message to write to the FIFO (if omitted, reads from stdin)
     message: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start an MCP server over stdio
+    Mcp,
 }
 
 fn main() -> Result<()> {
@@ -69,6 +80,12 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if let Some(Commands::Mcp) = cli.command {
+        // Block on the async MCP server.
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(mcp::run());
+    }
 
     match (cli.output, cli.input) {
         (Some(path), None) => cmd_output(&path, cli.message.as_deref(), cli.timeout),
