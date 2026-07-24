@@ -23,16 +23,18 @@ pub struct WriteRequest {
 pub struct ReadOneshotRequest {
     /// Path for the FIFO to create
     pub path: PathBuf,
-    /// Seconds to wait (None = block forever)
-    pub timeout: Option<u64>,
+    /// Seconds to wait before timing out. 0 = block forever (default).
+    #[serde(default)]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
 pub struct StartLingerRequest {
     /// Path for the FIFO to create
     pub path: PathBuf,
-    /// Seconds to wait for first writer (None = block forever)
-    pub timeout: Option<u64>,
+    /// Seconds to wait for first writer. 0 = block forever (default).
+    #[serde(default)]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
@@ -163,9 +165,9 @@ pub fn write_to_fifo(path: &Path, message: &str) -> Result<usize, String> {
 
 /// Create a FIFO, read one message from it, remove the FIFO, return the message.
 ///
-/// If `timeout` is Some(secs), returns Err after that many seconds
-/// with no writer.  The FIFO is always cleaned up before returning.
-pub fn read_oneshot(path: &Path, timeout: Option<u64>) -> Result<String, String> {
+/// If `timeout` is >0, returns Err after that many seconds with no writer.
+/// If `timeout` is 0 (default), blocks forever.  The FIFO is always cleaned up before returning.
+pub fn read_oneshot(path: &Path, timeout: u64) -> Result<String, String> {
     use std::fs;
 
     // Create the FIFO.
@@ -177,12 +179,16 @@ pub fn read_oneshot(path: &Path, timeout: Option<u64>) -> Result<String, String>
     result
 }
 
-fn read_oneshot_inner(path: &Path, timeout: Option<u64>) -> Result<String, String> {
+fn read_oneshot_inner(path: &Path, timeout: u64) -> Result<String, String> {
     use std::fs;
     use std::io::Read;
     use std::time::{Duration, Instant};
 
-    let deadline = timeout.map(|s| Instant::now() + Duration::from_secs(s));
+    let deadline = if timeout > 0 {
+        Some(Instant::now() + Duration::from_secs(timeout))
+    } else {
+        None
+    };
     let path_display = path.display().to_string();
 
     // Use a blocking thread for the open+read so we can poll for timeout.
@@ -365,7 +371,7 @@ impl Drop for LingerReader {
 /// The reader thread uses a blocking `open()` — it waits for a writer.
 /// To stop the reader, call `stop()` which opens the FIFO as a writer
 /// itself to unblock the reader's `open()`, then removes the FIFO.
-pub fn start_linger(path: &Path, _timeout: Option<u64>) -> Result<LingerReader, String> {
+pub fn start_linger(path: &Path, _timeout: u64) -> Result<LingerReader, String> {
     create_mcp_fifo(path)?;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -518,7 +524,7 @@ mod tests {
         });
 
         // Read one message — should create FIFO, read, then remove it.
-        let result = read_oneshot(&fifo, None);
+        let result = read_oneshot(&fifo, 0);
         writer.join().unwrap();
 
         assert!(result.is_ok());
@@ -535,7 +541,7 @@ mod tests {
         let fifo = tmp.path().join("timeout.fifo");
 
         // No writer — should time out after 1 second.
-        let result = read_oneshot(&fifo, Some(1));
+        let result = read_oneshot(&fifo, 1);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("timed out"));
 
@@ -560,7 +566,7 @@ mod tests {
             write_to_fifo(&fifo_clone, "no newline").unwrap();
         });
 
-        let result = read_oneshot(&fifo, None);
+        let result = read_oneshot(&fifo, 0);
         writer.join().unwrap();
 
         // Should have a trailing newline appended.
@@ -575,7 +581,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fifo = tmp.path().join("linger1.fifo");
 
-        let reader = start_linger(&fifo, None).unwrap();
+        let reader = start_linger(&fifo, 0).unwrap();
         assert!(fifo.exists(), "FIFO should exist after start_linger");
 
         // Give the reader thread time to block on open().
@@ -594,7 +600,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fifo = tmp.path().join("linger2.fifo");
 
-        let reader = start_linger(&fifo, None).unwrap();
+        let reader = start_linger(&fifo, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
 
         write_to_fifo(&fifo, "first").unwrap();
@@ -613,7 +619,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fifo = tmp.path().join("linger3.fifo");
 
-        let reader = start_linger(&fifo, None).unwrap();
+        let reader = start_linger(&fifo, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
 
         // Stop while no writer is connected — should not hang.
@@ -627,7 +633,7 @@ mod tests {
         let fifo = tmp.path().join("linger4.fifo");
 
         {
-            let _reader = start_linger(&fifo, None).unwrap();
+            let _reader = start_linger(&fifo, 0).unwrap();
             thread::sleep(Duration::from_millis(50));
             assert!(fifo.exists());
         }
@@ -641,7 +647,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fifo = tmp.path().join("linger5.fifo");
 
-        let reader = start_linger(&fifo, None).unwrap();
+        let reader = start_linger(&fifo, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
 
         let msgs = reader.stop().unwrap();
