@@ -461,15 +461,13 @@ agent framework).
 | `synctell_write` | Write a message to a FIFO | `path` (string), `message` (string) |
 | `synctell_read_oneshot` | Create a FIFO, read one message, remove FIFO | `path` (string), `timeout` (integer, optional, 0 = block forever) |
 | `synctell_read_start_linger` | Create a FIFO, start a background reader accepting multiple writers | `path` (string), `timeout` (integer, optional, accepted but not yet enforced) |
+| `synctell_read_still_linger` | Read the next message from an active linger reader without stopping it | `path` (string), `timeout` (integer, optional, 0 = block forever) |
 | `synctell_read_stop_linger` | Stop a lingering reader, return buffered data | `path` (string) |
 | `synctell_broadcast` | Broadcast a message from one FIFO to multiple output FIFOs | `path` (string), `outputs` (string array), `timeout` (integer, optional), `max_time` (integer, optional) |
 
 ### Timeout semantics
 
-The `timeout` parameter on `synctell_read_oneshot` and `synctell_broadcast`
-accepts a non-negative integer in seconds. A value of `0` (the default)
-means **block forever** — the tool waits indefinitely for a peer. A
-positive value means "return an error if no peer appears within N seconds."
+The `timeout` parameter on `synctell_read_oneshot`, `synctell_read_still_linger`, and `synctell_broadcast` accepts a non-negative integer in seconds. A value of `0` (the default) means **block forever** — the tool waits indefinitely for a peer or message. A positive value means "return an error if no peer (or message) appears within N seconds."
 
 The `max_time` parameter on `synctell_broadcast` accepts a non-negative
 integer in seconds. A value of `0` (the default) means no limit. A
@@ -494,8 +492,10 @@ extensions:
    create a FIFO and start listening.
 2. The FIFO's presence on disk signals that a reader is active.
 3. Call `synctell_write` to deliver messages to the FIFO.
-4. For linger mode, call `synctell_read_stop_linger` to collect all
-   buffered messages and clean up.
+4. (Optional) Call `synctell_read_still_linger` to read the next message
+   without stopping the reader. Repeat as needed for each message.
+5. Call `synctell_read_stop_linger` to collect all remaining buffered
+   messages and clean up.
 
 For one-shot communication, `synctell_read_oneshot` handles the full
 lifecycle: create FIFO → read one message → remove FIFO — in a single

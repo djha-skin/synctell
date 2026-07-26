@@ -146,6 +146,22 @@ impl SynctellServer {
         let msgs = reader.stop()?;
         Ok(msgs.join(""))
     }
+
+    #[tool(description = "Read the next message from an active linger reader without stopping it")]
+    fn synctell_read_still_linger(
+        &self,
+        Parameters(StillLingerRequest { path, timeout }): Parameters<StillLingerRequest>,
+    ) -> Result<String, String> {
+        let mut readers = self
+            .readers
+            .lock()
+            .map_err(|e| format!("lock error: {e}"))?;
+        let reader = readers
+            .get_mut(&path)
+            .ok_or_else(|| format!("no linger reader found for '{}'", path.display()))?;
+        let msg = reader.pop_message(timeout)?;
+        Ok(msg)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -163,6 +179,15 @@ pub async fn run() -> anyhow::Result<()> {
     let service = handler.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+pub struct StillLingerRequest {
+    /// Path of the FIFO to read from
+    pub path: PathBuf,
+    /// Seconds to wait for a message. 0 = block forever (default).
+    #[serde(default)]
+    pub timeout: u64,
 }
 
 // ─── Core logic (testable without MCP) ────────────────────────────
@@ -314,11 +339,12 @@ fn create_mcp_fifo(path: &Path) -> Result<(), String> {
 // ─── Linger reader ────────────────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 /// Handle to a running linger reader.
 pub struct LingerReader {
     stop: Arc<AtomicBool>,
-    buffer: Arc<Mutex<Vec<String>>>,
+    rx: std::sync::mpsc::Receiver<String>,
     handle: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
 }
@@ -363,8 +389,36 @@ impl LingerReader {
             let _ = handle.join();
         }
 
-        let buffer = std::mem::take(&mut *self.buffer.lock().unwrap());
-        Ok(buffer)
+        // Drain any remaining messages after the reader thread has exited.
+        let mut msgs = Vec::new();
+        while let Ok(msg) = self.rx.try_recv() {
+            msgs.push(msg);
+        }
+        Ok(msgs)
+    }
+
+    /// Read the next message from the linger reader without stopping it.
+    ///
+    /// If `timeout` is 0 (default), blocks until a message arrives.
+    /// If `timeout` > 0, returns Err after that many seconds with no message.
+    /// Returns Err if the reader has been stopped or the FIFO was removed.
+    pub fn pop_message(&mut self, timeout: u64) -> Result<String, String> {
+        use std::time::Duration;
+
+        if timeout == 0 {
+            self.rx.recv().map_err(|_| "linger reader has stopped".to_string())
+        } else {
+            self.rx
+                .recv_timeout(Duration::from_secs(timeout))
+                .map_err(|e| match e {
+                    mpsc::RecvTimeoutError::Timeout => {
+                        "timed out waiting for message".to_string()
+                    }
+                    mpsc::RecvTimeoutError::Disconnected => {
+                        "linger reader has stopped".to_string()
+                    }
+                })
+        }
     }
 }
 
@@ -393,7 +447,8 @@ impl Drop for LingerReader {
 /// Create a FIFO and start a background reader that accepts multiple writers.
 ///
 /// Returns a `LingerReader` handle.  Call `.stop()` to stop reading and
-/// retrieve all buffered messages.  The FIFO is cleaned up on stop (or drop).
+/// retrieve all buffered messages.  Call `.pop_message()` to read the next
+/// message without stopping.  The FIFO is cleaned up on stop (or drop).
 ///
 /// The reader thread uses a blocking `open()` — it waits for a writer.
 /// To stop the reader, call `stop()` which opens the FIFO as a writer
@@ -581,10 +636,9 @@ pub fn start_linger(path: &Path, _timeout: u64) -> Result<LingerReader, String> 
     create_mcp_fifo(path)?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let buffer = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (tx, rx) = mpsc::channel::<String>();
 
     let stop_clone = stop.clone();
-    let buffer_clone = buffer.clone();
     let path_buf = path.to_path_buf();
     let path_display = path.display().to_string();
 
@@ -625,14 +679,17 @@ pub fn start_linger(path: &Path, _timeout: u64) -> Result<LingerReader, String> 
                     msg.push('\n');
                 }
 
-                buffer_clone.lock().unwrap().push(msg);
+                if tx.send(msg).is_err() {
+                    // receiver dropped — exit
+                    return;
+                }
             }
         })
         .map_err(|e| format!("failed to spawn linger thread: {e}"))?;
 
     Ok(LingerReader {
         stop,
-        buffer,
+        rx,
         handle: Some(handle),
         path: path.to_path_buf(),
     })
@@ -856,6 +913,91 @@ mod tests {
         let reader = start_linger(&fifo, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
 
+        let msgs = reader.stop().unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    // ─── still_linger / pop_message tests ─────────────────────────
+
+    #[test]
+    fn test_still_linger_receives_one_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("still1.fifo");
+
+        let mut reader = start_linger(&fifo, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        write_to_fifo(&fifo, "hello").unwrap();
+
+        let msg = reader.pop_message(0).unwrap();
+        assert_eq!(msg, "hello\n");
+
+        // Reader is still alive — stop should work and return nothing new.
+        let msgs = reader.stop().unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_still_linger_multiple_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("still2.fifo");
+
+        let mut reader = start_linger(&fifo, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        write_to_fifo(&fifo, "first").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        write_to_fifo(&fifo, "second").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        write_to_fifo(&fifo, "third").unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(reader.pop_message(0).unwrap(), "first\n");
+        assert_eq!(reader.pop_message(0).unwrap(), "second\n");
+        assert_eq!(reader.pop_message(0).unwrap(), "third\n");
+
+        let msgs = reader.stop().unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_still_linger_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("still3.fifo");
+
+        let mut reader = start_linger(&fifo, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // No writer — should time out after 1 second.
+        let result = reader.pop_message(1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+
+        // Reader is still alive — stop it.
+        let msgs = reader.stop().unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_still_linger_blocks_until_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("still4.fifo");
+
+        let mut reader = start_linger(&fifo, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // Spawn a thread that writes after a delay.
+        let fifo_clone = fifo.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            write_to_fifo(&fifo_clone, "delayed").unwrap();
+        });
+
+        // This should block until the writer delivers.
+        let msg = reader.pop_message(0).unwrap();
+        assert_eq!(msg, "delayed\n");
+
+        writer.join().unwrap();
         let msgs = reader.stop().unwrap();
         assert!(msgs.is_empty());
     }
