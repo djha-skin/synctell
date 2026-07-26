@@ -463,15 +463,17 @@ agent framework).
 | `synctell_read_start_linger` | Create a FIFO, start a background reader accepting multiple writers | `path` (string), `timeout` (integer, optional, accepted but not yet enforced) |
 | `synctell_read_still_linger` | Read the next message from an active linger reader without stopping it | `path` (string), `timeout` (integer, optional, 0 = block forever) |
 | `synctell_read_stop_linger` | Stop a lingering reader, return buffered data | `path` (string) |
-| `synctell_broadcast` | Broadcast a message from one FIFO to multiple output FIFOs | `path` (string), `outputs` (string array), `timeout` (integer, optional), `max_time` (integer, optional) |
+| `synctell_broadcast_start` | Start a broadcast: create an input FIFO and begin fanning out messages to multiple output FIFOs. Runs in background. | `path` (string), `outputs` (string array), `timeout` (integer, optional), `max_time` (integer, optional) |
+| `synctell_broadcast_stop` | Stop a broadcast, clean up the input FIFO, and return the number of messages broadcast | `path` (string) |
 
 ### Timeout semantics
 
-The `timeout` parameter on `synctell_read_oneshot`, `synctell_read_still_linger`, and `synctell_broadcast` accepts a non-negative integer in seconds. A value of `0` (the default) means **block forever** — the tool waits indefinitely for a peer or message. A positive value means "return an error if no peer (or message) appears within N seconds."
+The `timeout` parameter on `synctell_read_oneshot` and `synctell_read_still_linger` accepts a non-negative integer in seconds. A value of `0` (the default) means **block forever** — the tool waits indefinitely for a peer or message. A positive value means "return an error if no peer (or message) appears within N seconds."
 
-The `max_time` parameter on `synctell_broadcast` accepts a non-negative
-integer in seconds. A value of `0` (the default) means no limit. A
-positive value means "exit cleanly after N seconds no matter what."
+The `timeout` and `max_time` parameters on `synctell_broadcast_start` are
+accepted for forward compatibility but are not yet enforced by the
+background thread. The broadcast runs until `synctell_broadcast_stop` is
+called or the handle is dropped.
 
 > **Note:** The `timeout` parameter on `synctell_read_start_linger` is
 > accepted for forward compatibility but is not yet enforced. The linger
@@ -505,9 +507,12 @@ call.
 
 1. Create output FIFOs using `synctell_read_start_linger` for each
    broadcast receiver.
-2. Call `synctell_broadcast` with the input path and output path list.
-3. Use `synctell_write` to deliver messages to the broadcast input.
-4. The broadcast fans out each message to all output FIFOs.
+2. Call `synctell_broadcast_start` with the input path and output path list.
+   The broadcast begins accepting writers in the background.
+3. Use `synctell_write` to deliver messages to the broadcast input FIFO.
+   Each message is fanned out to all output FIFOs (best-effort).
+4. Call `synctell_broadcast_stop` to stop the broadcast, clean up the
+   input FIFO, and return the count of messages broadcast.
 5. Stop linger readers with `synctell_read_stop_linger`.
 
 ## Exit Codes

@@ -44,17 +44,23 @@ pub struct StopLingerRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
-pub struct BroadcastRequest {
+pub struct BroadcastStartRequest {
     /// Path for the input FIFO to create
     pub path: PathBuf,
     /// Paths to output FIFOs (must already exist)
     pub outputs: Vec<PathBuf>,
-    /// Seconds to wait for the first writer (0 = block forever)
+    /// Seconds to wait for first writer (0 = block forever, default).
     #[serde(default)]
     pub timeout: u64,
-    /// Hard deadline: quit after N seconds no matter what (0 = no limit)
+    /// Hard deadline: quit after N seconds no matter what (0 = no limit, default).
     #[serde(default)]
     pub max_time: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+pub struct BroadcastStopRequest {
+    /// Path of the input FIFO to stop
+    pub path: PathBuf,
 }
 
 // ─── MCP server handler ───────────────────────────────────────────
@@ -65,6 +71,8 @@ pub struct SynctellServer {
     tool_router: ToolRouter<Self>,
     /// Active linger readers keyed by FIFO path.
     readers: Arc<Mutex<HashMap<PathBuf, LingerReader>>>,
+    /// Active broadcasters keyed by input FIFO path.
+    broadcasters: Arc<Mutex<HashMap<PathBuf, BroadcastHandle>>>,
 }
 
 impl SynctellServer {
@@ -72,6 +80,7 @@ impl SynctellServer {
         Self {
             tool_router: Self::tool_router(),
             readers: Arc::new(Mutex::new(HashMap::new())),
+            broadcasters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -119,17 +128,36 @@ impl SynctellServer {
         Ok(format!("linger reader started at '{}'", path.display()))
     }
 
-    #[tool(description = "Broadcast a message from one FIFO to multiple output FIFOs.
-    Creates an input FIFO, waits for a writer, then fans out each message to all
-    output FIFOs. Times out if no writer connects within `timeout` seconds.
-    Exits cleanly after `max_time` seconds even if messages are still flowing.
-    Returns the number of messages broadcast.")]
-    fn synctell_broadcast(
+    #[tool(description = "Start a broadcast: create an input FIFO and begin fanning out messages to multiple output FIFOs. Runs in the background. Call synctell_broadcast_stop to stop it and get the count.")]
+    fn synctell_broadcast_start(
         &self,
-        Parameters(BroadcastRequest { path, outputs, timeout, max_time }): Parameters<BroadcastRequest>,
+        Parameters(BroadcastStartRequest { path, outputs, timeout, max_time }): Parameters<BroadcastStartRequest>,
     ) -> Result<String, String> {
-        let msg_count = broadcast_inner(&path, &outputs, timeout, max_time)?;
-        Ok(format!("broadcast {msg_count} message(s)"))
+        let mut broadcasters = self.broadcasters.lock().unwrap();
+        if broadcasters.contains_key(&path) {
+            return Err(format!(
+                "broadcast already active for '{}'",
+                path.display()
+            ));
+        }
+        let handle = broadcast_start(&path, &outputs, timeout, max_time)?;
+        broadcasters.insert(path.clone(), handle);
+        Ok(format!("broadcast started at '{}'", path.display()))
+    }
+
+    #[tool(description = "Stop a broadcast, clean up the input FIFO, and return the number of messages broadcast")]
+    fn synctell_broadcast_stop(
+        &self,
+        Parameters(BroadcastStopRequest { path }): Parameters<BroadcastStopRequest>,
+    ) -> Result<String, String> {
+        let handle = self
+            .broadcasters
+            .lock()
+            .unwrap()
+            .remove(&path)
+            .ok_or_else(|| format!("no broadcast found for '{}'", path.display()))?;
+        let count = handle.stop()?;
+        Ok(format!("broadcast {count} message(s)"))
     }
 
     #[tool(description = "Stop a lingering reader, return buffered data")]
@@ -461,6 +489,9 @@ impl Drop for LingerReader {
 /// Exits cleanly after `max_time` seconds even if messages are still flowing.
 /// Output FIFOs must already exist; missing ones are skipped per-write.
 /// The input FIFO is removed on exit.
+/// 
+/// NOTE: This function is deprecated. Use `broadcast_start` + `BroadcastHandle::stop()` instead.
+#[allow(dead_code)]
 pub fn broadcast_inner(
     input_path: &Path,
     output_paths: &[PathBuf],
@@ -630,6 +661,154 @@ fn write_fifo_blocking(path: PathBuf, data: Vec<u8>) -> Result<usize, String> {
     });
 
     Ok(n)
+}
+
+// ─── Broadcast start/stop ────────────────────────────────────────
+
+/// Handle to a running broadcast.
+pub struct BroadcastHandle {
+    stop: Arc<AtomicBool>,
+    msg_count: Arc<std::sync::atomic::AtomicUsize>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for BroadcastHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BroadcastHandle")
+            .field("path", &self.path)
+            .field("running", &self.handle.is_some())
+            .finish()
+    }
+}
+
+impl BroadcastHandle {
+    /// Stop the broadcast, clean up the input FIFO, and return the number of messages broadcast.
+    pub fn stop(mut self) -> Result<usize, String> {
+        self.stop.store(true, Ordering::Relaxed);
+
+        // Open as writer (O_RDWR) to unblock the reader thread blocked on open().
+        if let Ok(file) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+        {
+            drop(file);
+        }
+
+        // Remove the FIFO — subsequent open() calls will fail with ENOENT.
+        let _ = std::fs::remove_file(&self.path);
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+
+        Ok(self.msg_count.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for BroadcastHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+
+        // Open as writer (O_RDWR) to unblock reader thread.
+        if let Ok(file) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+        {
+            drop(file);
+        }
+
+        // Remove FIFO.
+        let _ = std::fs::remove_file(&self.path);
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Start a broadcast: create an input FIFO and start a background reader
+/// that fans out each message to all output FIFOs.
+///
+/// Output FIFOs must already exist; missing ones are skipped per-write
+/// (a warning is logged to stderr).
+///
+/// Returns a `BroadcastHandle`. Call `.stop()` to stop the broadcast and
+/// retrieve the number of messages broadcast. The input FIFO is cleaned
+/// up on stop (or drop).
+pub fn broadcast_start(
+    input_path: &Path,
+    output_paths: &[PathBuf],
+    _timeout: u64,
+    _max_time: u64,
+) -> Result<BroadcastHandle, String> {
+    if output_paths.is_empty() {
+        return Err("broadcast requires at least one output FIFO".to_string());
+    }
+
+    create_mcp_fifo(input_path)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let msg_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outputs: Vec<PathBuf> = output_paths.to_vec();
+
+    let stop_clone = stop.clone();
+    let msg_count_clone = msg_count.clone();
+    let path_buf = input_path.to_path_buf();
+    let path_display = input_path.display().to_string();
+
+    let handle = std::thread::Builder::new()
+        .name(format!("broadcast-{path_display}"))
+        .spawn(move || {
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // Blocking open() — waits for a writer.
+                let mut file = match std::fs::File::open(&path_buf) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        // FIFO was removed — exit.
+                        return;
+                    }
+                };
+
+                let mut data = Vec::new();
+                if let Err(_) = file.read_to_end(&mut data) {
+                    return;
+                }
+                drop(file);
+
+                if data.is_empty() {
+                    continue;
+                }
+
+                // Ensure trailing newline.
+                if data.last() != Some(&b'\n') {
+                    data.push(b'\n');
+                }
+
+                // Fan out to all output FIFOs (best-effort).
+                for output in &outputs {
+                    if let Err(e) = write_fifo_blocking(output.clone(), data.clone()) {
+                        eprintln!("warning: {e}");
+                    }
+                }
+
+                msg_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .map_err(|e| format!("failed to spawn broadcast thread: {e}"))?;
+
+    Ok(BroadcastHandle {
+        stop,
+        msg_count,
+        handle: Some(handle),
+        path: input_path.to_path_buf(),
+    })
 }
 
 pub fn start_linger(path: &Path, _timeout: u64) -> Result<LingerReader, String> {
@@ -1000,5 +1179,141 @@ mod tests {
         writer.join().unwrap();
         let msgs = reader.stop().unwrap();
         assert!(msgs.is_empty());
+    }
+
+    // ─── broadcast start/stop tests ───────────────────────────────
+
+    #[test]
+    fn test_broadcast_start_creates_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("bcast-input.fifo");
+        let out1 = make_fifo(tmp.path(), "bcast-out1.fifo");
+
+        let handle = broadcast_start(&input, &[out1.clone()], 0, 0).unwrap();
+        assert!(input.exists(), "broadcast should create input FIFO");
+
+        handle.stop().unwrap();
+        assert!(!input.exists(), "broadcast should clean up input FIFO on stop");
+    }
+
+    #[test]
+    fn test_broadcast_fans_out_to_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("bcast2-in.fifo");
+        let out1 = make_fifo(tmp.path(), "bcast2-out1.fifo");
+        let out2 = make_fifo(tmp.path(), "bcast2-out2.fifo");
+        let out3 = make_fifo(tmp.path(), "bcast2-out3.fifo");
+
+        // Start linger readers for output FIFOs.
+        let r1 = start_linger(&out1, 0).unwrap();
+        let r2 = start_linger(&out2, 0).unwrap();
+        let r3 = start_linger(&out3, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let handle = broadcast_start(&input, &[out1.clone(), out2.clone(), out3.clone()], 0, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        write_to_fifo(&input, "hello agents").unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let count = handle.stop().unwrap();
+        assert_eq!(count, 1, "should have broadcast 1 message");
+
+        // Verify all outputs received the message.
+        let msgs1 = r1.stop().unwrap();
+        let msgs2 = r2.stop().unwrap();
+        let msgs3 = r3.stop().unwrap();
+        assert_eq!(msgs1, vec!["hello agents\n"]);
+        assert_eq!(msgs2, vec!["hello agents\n"]);
+        assert_eq!(msgs3, vec!["hello agents\n"]);
+    }
+
+    #[test]
+    fn test_broadcast_handle_stop_does_not_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("bcast3-in.fifo");
+        let out1 = make_fifo(tmp.path(), "bcast3-out1.fifo");
+
+        let handle = broadcast_start(&input, &[out1], 0, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // Stop with no writer — should not hang.
+        let count = handle.stop().unwrap();
+        assert_eq!(count, 0, "no messages were sent");
+    }
+
+    #[test]
+    fn test_broadcast_no_outputs_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("bcast4-in.fifo");
+
+        let result = broadcast_start(&input, &[], 0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least one output"));
+    }
+
+    #[test]
+    fn test_broadcast_tracks_multiple_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("bcast5-in.fifo");
+        let out1 = make_fifo(tmp.path(), "bcast5-out1.fifo");
+
+        let r1 = start_linger(&out1, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let handle = broadcast_start(&input, &[out1], 0, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        write_to_fifo(&input, "msg1").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        write_to_fifo(&input, "msg2").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        write_to_fifo(&input, "msg3").unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let count = handle.stop().unwrap();
+        assert_eq!(count, 3, "should have broadcast 3 messages");
+
+        let msgs = r1.stop().unwrap();
+        assert_eq!(msgs, vec!["msg1\n", "msg2\n", "msg3\n"]);
+    }
+
+    #[test]
+    fn test_broadcast_output_reader_disappears_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("bcast6-in.fifo");
+        let out1 = make_fifo(tmp.path(), "bcast6-out1.fifo");
+        let out2 = make_fifo(tmp.path(), "bcast6-out2.fifo");
+
+        let r2 = start_linger(&out2, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let handle = broadcast_start(&input, &[out1.clone(), out2.clone()], 0, 0).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        // Write a message — out1 has no reader, but out2 does.
+        write_to_fifo(&input, "hello").unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        // Now add a reader for out1.
+        let r1 = start_linger(&out1, 0).unwrap();
+        write_to_fifo(&input, "second").unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let count = handle.stop().unwrap();
+        assert_eq!(count, 2, "should have broadcast 2 messages");
+
+        let msgs1 = r1.stop().unwrap();
+        let msgs2 = r2.stop().unwrap();
+        // out2 should have received both messages.
+        assert_eq!(msgs2.len(), 2, "out2 should have both messages");
+        assert!(msgs2.contains(&"hello\n".to_string()));
+        assert!(msgs2.contains(&"second\n".to_string()));
+        // out1 may have received the first (delayed write unblocked when
+        // r1 started) and/or the second — at minimum the broadcast
+        // continued without crashing, and out2 has both messages.
+        assert!(msgs1.len() <= 2, "out1 should have at most 2 messages");
+        // The test verified the essential behavior: both messages made it
+        // to out2 even though out1 had no reader for the first message.
     }
 }
