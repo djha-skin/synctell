@@ -29,45 +29,60 @@ extern "C" fn handle_signal(_sig: libc::c_int) {
 #[command(
     name = "synctell",
     version,
-    about = "Instantly create and use FIFO special files for inter-process messaging",
-    long_about = "synctell creates and interacts with FIFO (named pipe) special files.\n\n\
-                  Input mode (-i): creates a FIFO and reads messages from writers.\n\
-                  Output mode (-o): polls for a FIFO and writes a message to it.\n\n\
-                  Input mode creates a FIFO and reads messages from writers.\n\
-                  Without --linger, the reader exits after the first message.\n\
-                  With --linger, it stays alive for more writers until interrupted.\n\
-                  Its presence on disk signals that a reader is listening.\n\
-                  The FIFO is removed when the reader exits.\n\n\
-                  Output mode does not create anything; it polls the filesystem for\n\
-                  the target file every second.  Use -t to set a timeout.\n\
-                  Without -t, output exits immediately if the file is absent."
+    about = "Instantly create and use FIFO special files for inter-process messaging"
 )]
 struct Cli {
-    /// Poll for FILE and write to it once it appears
-    #[arg(short = 'o', long = "output", value_name = "FILE", conflicts_with = "input")]
-    output: Option<PathBuf>,
-
-    /// Create a FIFO at FILE and read from it
-    #[arg(short = 'i', long = "input", value_name = "FILE", conflicts_with = "output")]
-    input: Option<PathBuf>,
-
-    /// Keep reading after the first message (only with -i)
-    #[arg(short = 'l', long = "linger", conflicts_with = "output")]
-    linger: bool,
-
-    /// Seconds to wait before timing out
-    #[arg(short = 't', long = "timeout", value_name = "SECS")]
-    timeout: Option<u64>,
-
-    /// Message to write to the FIFO (if omitted, reads from stdin)
-    message: Option<String>,
-
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a FIFO and read messages from writers
+    Read {
+        /// Path for the FIFO to create
+        path: PathBuf,
+
+        /// Keep reading after the first message
+        #[arg(short = 'l', long = "linger")]
+        linger: bool,
+
+        /// Seconds to wait for the first writer (0 = block forever)
+        #[arg(short = 't', long = "timeout", value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Hard deadline: quit after N seconds no matter what (0 = no limit)
+        #[arg(short = 'm', long = "max-time", value_name = "SECS")]
+        max_time: Option<u64>,
+    },
+
+    /// Poll for a FIFO and write a message to it
+    Write {
+        /// Path to the FIFO to write to
+        path: PathBuf,
+
+        /// Seconds to wait for the FIFO to appear (0 = must exist now)
+        #[arg(short = 't', long = "timeout", value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Message to write (if omitted, reads from stdin)
+        message: Option<String>,
+    },
+
+    /// Broadcast: read from one FIFO, write to many
+    Broadcast {
+        /// Path for the input FIFO to create
+        input: PathBuf,
+
+        /// Paths to output FIFOs (must already exist)
+        #[arg(required = true, num_args = 1..)]
+        outputs: Vec<PathBuf>,
+
+        /// Seconds to wait for the first writer (0 = block forever)
+        #[arg(short = 't', long = "timeout", value_name = "SECS")]
+        timeout: Option<u64>,
+    },
+
     /// Start an MCP server over stdio
     Mcp,
 }
@@ -81,20 +96,28 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::Mcp) = cli.command {
-        // Block on the async MCP server.
-        let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(mcp::run());
-    }
-
-    match (cli.output, cli.input) {
-        (Some(path), None) => cmd_output(&path, cli.message.as_deref(), cli.timeout),
-        (None, Some(path)) => cmd_input(&path, cli.timeout, cli.linger),
-        _ => {
-            eprintln!("error: exactly one of -o or -i must be specified");
-            eprintln!("try 'synctell --help' for more information");
-            std::process::exit(1);
+    match cli.command {
+        Commands::Read {
+            path,
+            linger,
+            timeout,
+            max_time,
+        } => cmd_input(&path, timeout, linger, max_time),
+        Commands::Write {
+            path,
+            timeout,
+            message,
+        } => cmd_output(&path, message.as_deref(), timeout),
+        Commands::Mcp => {
+            // Block on the async MCP server.
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(mcp::run())
         }
+        Commands::Broadcast {
+            input,
+            outputs,
+            timeout,
+        } => cmd_broadcast(&input, &outputs, timeout),
     }
 }
 
@@ -211,6 +234,8 @@ enum ReadResult {
     Data(Vec<u8>),
     /// No writer connected before the deadline expired.
     TimedOut,
+    /// The max-time hard deadline was exceeded.
+    MaxTimeReached,
     /// A signal requested shutdown.
     Interrupted,
 }
@@ -232,16 +257,30 @@ enum ReadResult {
 /// not end with `'\n'`, the reader appends one.  This makes
 /// many-writer output cleanly line-separated.
 /// The FIFO is removed on exit.
-fn cmd_input(path: &Path, timeout: Option<u64>, linger: bool) -> Result<()> {
+fn cmd_input(
+    path: &Path,
+    timeout: Option<u64>,
+    linger: bool,
+    max_time: Option<u64>,
+) -> Result<()> {
     let path_display = path.display().to_string();
 
     // Reader creates the FIFO — its presence signals "someone is listening".
     create_fifo(path)?;
 
-    let mut deadline = timeout.map(|s| Instant::now() + Duration::from_secs(s));
+    // -t 0 means "no timeout" (block forever), same as omitting -t.
+    let mut deadline = timeout
+        .filter(|&s| s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
+
+    // -m 0 means "no max-time" (block forever), same as omitting -m.
+    // Unlike timeout, max-time is NEVER discarded — it's a hard deadline.
+    let max_deadline = max_time
+        .filter(|&s| s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
 
     loop {
-        match read_one_message(path, deadline, &path_display)? {
+        match read_one_message(path, deadline, max_deadline, &path_display)? {
             ReadResult::Data(data) => {
                 io::stdout()
                     .write_all(&data)
@@ -259,6 +298,7 @@ fn cmd_input(path: &Path, timeout: Option<u64>, linger: bool) -> Result<()> {
                 }
                 // After the first successful read, remove the timeout.
                 // The reader persists until interrupted (linger mode).
+                // max_deadline is NOT removed — it's a hard deadline.
                 deadline = None;
             }
             ReadResult::TimedOut => {
@@ -267,6 +307,7 @@ fn cmd_input(path: &Path, timeout: Option<u64>, linger: bool) -> Result<()> {
                 eprintln!("error: timed out waiting for writer on '{path_display}'");
                 std::process::exit(124);
             }
+            ReadResult::MaxTimeReached => break,
             ReadResult::Interrupted => break,
         }
     }
@@ -284,6 +325,7 @@ fn cmd_input(path: &Path, timeout: Option<u64>, linger: bool) -> Result<()> {
 fn read_one_message(
     path: &Path,
     deadline: Option<Instant>,
+    max_deadline: Option<Instant>,
     path_display: &str,
 ) -> Result<ReadResult> {
     let outcome: ReadOutcome = Arc::new((Mutex::new(None), Condvar::new()));
@@ -342,7 +384,187 @@ fn read_one_message(
         {
             return Ok(ReadResult::TimedOut);
         }
+
+        // Max-time hard deadline exceeded — exit cleanly.
+        if let Some(dl) = max_deadline
+            && Instant::now() >= dl
+        {
+            return Ok(ReadResult::MaxTimeReached);
+        }
     }
+}
+
+// ─── Broadcast mode ───────────────────────────────────────────────
+
+/// Write data to a FIFO, blocking until a reader is ready.
+///
+/// Spawns a background thread for the blocking open+write so the
+/// caller never hangs.  The thread is detached (no join) so the
+/// fan-out loop in the broadcast can dispatch to all outputs
+/// concurrently without waiting for any single output's reader.
+/// Returns `Ok(bytes_written)` or `Err(message)` — but note that
+/// when the FIFO has no reader, the thread will block on open()
+/// indefinitely, so the Err case is only for immediate failures
+/// (e.g. nonexistent path).
+fn write_fifo_blocking(path: PathBuf, data: Vec<u8>) -> Result<usize, String> {
+    if !path.exists() {
+        return Err(format!(
+            "'{}' does not exist (no reader listening)",
+            path.display()
+        ));
+    }
+
+    let n = data.len();
+    let path_display = path.display().to_string();
+    let _ = std::thread::spawn(move || {
+        match std::fs::File::options()
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(&data) {
+                    eprintln!("warning: failed to write to '{}': {e}", path_display);
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: failed to open '{}' for writing: {e}", path_display);
+            }
+        }
+    });
+
+    Ok(n)
+}
+
+/// Broadcast mode: create an input FIFO, read messages, fan out to
+/// all output FIFOs.
+///
+/// Linger is implicitly always on for the input.
+/// `-t N` timeout governs the wait for the first writer only — once
+/// a message arrives the timeout is discarded.
+/// Output FIFOs must already exist; missing ones are skipped per-write.
+/// The input FIFO is removed on exit.
+fn cmd_broadcast(
+    input_path: &Path,
+    output_paths: &[PathBuf],
+    timeout: Option<u64>,
+) -> Result<()> {
+    if output_paths.is_empty() {
+        anyhow::bail!("broadcast requires at least one output FIFO");
+    }
+
+    create_fifo(input_path)?;
+
+    let input_display = input_path.display().to_string();
+
+    // Set up a channel: reader thread → broadcast loop.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let input_clone = input_path.to_path_buf();
+
+    // Reader thread: loops blocking on open → read_to_end → send.
+    let reader_handle = thread::Builder::new()
+        .name(format!("broadcast-reader-{input_display}"))
+        .spawn(move || {
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut file = match fs::File::open(&input_clone) {
+                    Ok(f) => f,
+                    Err(_) => return, // FIFO removed — exit.
+                };
+                let mut data = Vec::new();
+                if file.read_to_end(&mut data).is_err() {
+                    return;
+                }
+                drop(file);
+                if data.is_empty() {
+                    continue; // Writer disconnected with no data.
+                }
+                if tx.send(data).is_err() {
+                    return; // Receiver dropped — exit.
+                }
+            }
+        })
+        .context("failed to spawn broadcast reader thread")?;
+
+    // -t 0 means "no timeout" (block forever), same as omitting -t.
+    let deadline = timeout
+        .filter(|&s| s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
+
+    // Main loop: receive messages from the reader and fan out.
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(data) => {
+                // Ensure trailing newline.
+                let mut msg = data;
+                if msg.last() != Some(&b'\n') {
+                    msg.push(b'\n');
+                }
+
+                for output in output_paths {
+                    let out = output.clone();
+                    let msg_clone = msg.clone();
+                    if let Err(e) = write_fifo_blocking(out, msg_clone) {
+                        eprintln!("warning: {e}");
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Check timeout deadline.
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        // Clean up before exiting (124 = timeout).
+                        stop.store(true, Ordering::Relaxed);
+                        if let Ok(file) = std::fs::File::options()
+                            .read(true)
+                            .write(true)
+                            .open(input_path)
+                        {
+                            drop(file);
+                        }
+                        let _ = fs::remove_file(input_path);
+                        let _ = reader_handle.join();
+                        eprintln!(
+                            "error: timed out waiting for writer on '{input_display}'"
+                        );
+                        std::process::exit(124);
+                    }
+                }
+                // Check signal.
+                if QUIT.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Reader thread exited (FIFO removed or error).
+                break;
+            }
+        }
+    }
+
+    // Cleanup.
+    stop.store(true, Ordering::Relaxed);
+
+    // Open the FIFO as a writer (O_RDWR) to unblock the reader thread
+    // which is blocked on open(). On Linux, O_RDWR always succeeds on
+    // a FIFO regardless of whether a reader is connected, which
+    // unblocks the reader's O_RDONLY open(). Once the reader sees the
+    // stop flag, it exits.
+    if let Ok(file) = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(input_path)
+    {
+        drop(file);
+    }
+
+    let _ = fs::remove_file(input_path);
+    let _ = reader_handle.join();
+
+    Ok(())
 }
 
 // ─── FIFO creation ─────────────────────────────────────────────────
