@@ -168,3 +168,128 @@ fn read_timeout_zero_blocks_forever() {
 
     assert!(!path.exists(), "FIFO should be removed after read");
 }
+
+// ─── Max-time (-m) tests ───────────────────────────────────────────
+
+/// `synctell read -m 2 <fifo>` with no writer → exits after ~2s (exit 0, no data).
+/// Unlike -t, -m is a hard deadline: exit 0 even if no writer connects.
+#[test]
+fn read_max_time_no_writer_exits_cleanly() {
+    let path = fifo_path("max_time_no_writer.fifo");
+    cleanup(&path);
+
+    let start = std::time::Instant::now();
+    let output = run_read(&["-m", "2", path.to_str().unwrap()]);
+    let elapsed = start.elapsed();
+
+    // -m exits 0, not 124 — it's a hard deadline, not a timeout error.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0 on max-time, got {:?}",
+        output.status.code()
+    );
+
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "should wait ~2s, only took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "took too long: {elapsed:?}"
+    );
+
+    assert!(!path.exists(), "FIFO should be removed");
+}
+
+/// `synctell read -l -m 2 <fifo>` with a writer: receives messages, then exits cleanly after 2s.
+#[test]
+fn read_max_time_linger_receives_then_exits() {
+    let path = fifo_path("max_time_linger.fifo");
+    cleanup(&path);
+
+    let path_clone = path.clone();
+    let writer = std::thread::spawn(move || {
+        // Wait for FIFO to appear.
+        for _ in 0..50 {
+            if path_clone.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path_clone.exists(), "FIFO should exist");
+
+        // Give reader time to block on open, then write.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"first message").unwrap();
+        drop(file);
+
+        // After a short delay, write another message.
+        std::thread::sleep(Duration::from_millis(500));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"second message").unwrap();
+    });
+
+    // -m 4 to give time for both messages, but not forever.
+    let output = run_read(&["-l", "-m", "4", path.to_str().unwrap()]);
+    writer.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0 on max-time, got {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("first message"), "should have received first message: {stdout:?}");
+    assert!(stdout.contains("second message"), "should have received second message: {stdout:?}");
+
+    assert!(!path.exists(), "FIFO should be removed");
+}
+
+/// `synctell read -m 0 <fifo>` behaves same as no -m (blocks forever).
+#[test]
+fn read_max_time_zero_blocks_forever() {
+    let path = fifo_path("max_time_zero.fifo");
+    cleanup(&path);
+
+    let path_clone = path.clone();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..50 {
+            if path_clone.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path_clone.exists(), "FIFO should exist");
+        std::thread::sleep(Duration::from_millis(100));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"hello after wait").unwrap();
+    });
+
+    let output = run_read(&["-m", "0", path.to_str().unwrap()]);
+    writer.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0, got {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("hello after wait"), "should contain message: {stdout:?}");
+
+    assert!(!path.exists(), "FIFO should be removed");
+}

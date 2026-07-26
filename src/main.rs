@@ -81,6 +81,10 @@ enum Commands {
         /// Seconds to wait for the first writer (0 = block forever)
         #[arg(short = 't', long = "timeout", value_name = "SECS")]
         timeout: Option<u64>,
+
+        /// Hard deadline: quit after N seconds no matter what (0 = no limit)
+        #[arg(short = 'm', long = "max-time", value_name = "SECS")]
+        max_time: Option<u64>,
     },
 
     /// Start an MCP server over stdio
@@ -117,7 +121,8 @@ fn main() -> Result<()> {
             input,
             outputs,
             timeout,
-        } => cmd_broadcast(&input, &outputs, timeout),
+            max_time,
+        } => cmd_broadcast(&input, &outputs, timeout, max_time),
     }
 }
 
@@ -447,6 +452,7 @@ fn cmd_broadcast(
     input_path: &Path,
     output_paths: &[PathBuf],
     timeout: Option<u64>,
+    max_time: Option<u64>,
 ) -> Result<()> {
     if output_paths.is_empty() {
         anyhow::bail!("broadcast requires at least one output FIFO");
@@ -494,8 +500,20 @@ fn cmd_broadcast(
         .filter(|&s| s > 0)
         .map(|s| Instant::now() + Duration::from_secs(s));
 
+    // -m 0 means "no max-time" (block forever), same as omitting -m.
+    // Unlike timeout, max-time is NEVER discarded — it's a hard deadline.
+    let max_deadline = max_time
+        .filter(|&s| s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
+
     // Main loop: receive messages from the reader and fan out.
     loop {
+        // Check max-time hard deadline first.
+        if let Some(dl) = max_deadline
+            && Instant::now() >= dl
+        {
+            break;
+        }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(data) => {
                 // Ensure trailing newline.

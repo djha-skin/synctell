@@ -43,6 +43,20 @@ pub struct StopLingerRequest {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+pub struct BroadcastRequest {
+    /// Path for the input FIFO to create
+    pub path: PathBuf,
+    /// Paths to output FIFOs (must already exist)
+    pub outputs: Vec<PathBuf>,
+    /// Seconds to wait for the first writer (0 = block forever)
+    #[serde(default)]
+    pub timeout: u64,
+    /// Hard deadline: quit after N seconds no matter what (0 = no limit)
+    #[serde(default)]
+    pub max_time: u64,
+}
+
 // ─── MCP server handler ───────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -103,6 +117,19 @@ impl SynctellServer {
         let reader = start_linger(&path, timeout)?;
         readers.insert(path.clone(), reader);
         Ok(format!("linger reader started at '{}'", path.display()))
+    }
+
+    #[tool(description = "Broadcast a message from one FIFO to multiple output FIFOs.
+    Creates an input FIFO, waits for a writer, then fans out each message to all
+    output FIFOs. Times out if no writer connects within `timeout` seconds.
+    Exits cleanly after `max_time` seconds even if messages are still flowing.
+    Returns the number of messages broadcast.")]
+    fn synctell_broadcast(
+        &self,
+        Parameters(BroadcastRequest { path, outputs, timeout, max_time }): Parameters<BroadcastRequest>,
+    ) -> Result<String, String> {
+        let msg_count = broadcast_inner(&path, &outputs, timeout, max_time)?;
+        Ok(format!("broadcast {msg_count} message(s)"))
     }
 
     #[tool(description = "Stop a lingering reader, return buffered data")]
@@ -371,6 +398,185 @@ impl Drop for LingerReader {
 /// The reader thread uses a blocking `open()` — it waits for a writer.
 /// To stop the reader, call `stop()` which opens the FIFO as a writer
 /// itself to unblock the reader's `open()`, then removes the FIFO.
+
+/// Broadcast: create an input FIFO, read messages, fan out to all output FIFOs.
+///
+/// Returns the number of messages broadcast before exiting.
+/// Times out (returns an error) if no writer connects within `timeout` seconds.
+/// Exits cleanly after `max_time` seconds even if messages are still flowing.
+/// Output FIFOs must already exist; missing ones are skipped per-write.
+/// The input FIFO is removed on exit.
+pub fn broadcast_inner(
+    input_path: &Path,
+    output_paths: &[PathBuf],
+    timeout: u64,
+    max_time: u64,
+) -> Result<usize, String> {
+    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    if output_paths.is_empty() {
+        return Err("broadcast requires at least one output FIFO".to_string());
+    }
+
+    create_mcp_fifo(input_path)?;
+
+    let input_display = input_path.display().to_string();
+
+    // Set up a channel: reader thread -> broadcast loop.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let input_clone = input_path.to_path_buf();
+
+    // Reader thread: loops blocking on open -> read_to_end -> send.
+    let reader_handle = std::thread::Builder::new()
+        .name(format!("broadcast-reader-{input_display}"))
+        .spawn(move || {
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut file = match std::fs::File::open(&input_clone) {
+                    Ok(f) => f,
+                    Err(_) => return, // FIFO removed — exit.
+                };
+                let mut data = Vec::new();
+                if file.read_to_end(&mut data).is_err() {
+                    return;
+                }
+                drop(file);
+                if data.is_empty() {
+                    continue; // Writer disconnected with no data.
+                }
+                if tx.send(data).is_err() {
+                    return; // Receiver dropped — exit.
+                }
+            }
+        })
+        .map_err(|e| format!("failed to spawn broadcast reader thread: {e}"))?;
+
+    let timeout_deadline = if timeout > 0 {
+        Some(Instant::now() + Duration::from_secs(timeout))
+    } else {
+        None
+    };
+    let max_deadline = if max_time > 0 {
+        Some(Instant::now() + Duration::from_secs(max_time))
+    } else {
+        None
+    };
+
+    let mut msg_count = 0usize;
+
+    // Main loop: receive messages from the reader and fan out.
+    loop {
+        // Check max-time hard deadline first.
+        if let Some(dl) = max_deadline
+            && Instant::now() >= dl
+        {
+            break;
+        }
+
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(data) => {
+                // Ensure trailing newline.
+                let mut msg = data;
+                if msg.last() != Some(&b'\n') {
+                    msg.push(b'\n');
+                }
+
+                for output in output_paths {
+                    let out = output.clone();
+                    let msg_clone = msg.clone();
+                    // Use the existing write_fifo_blocking logic (best-effort).
+                    if let Err(e) = write_fifo_blocking(out, msg_clone) {
+                        eprintln!("warning: {e}");
+                    }
+                }
+                msg_count += 1;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Check timeout deadline.
+                if let Some(dl) = timeout_deadline {
+                    if Instant::now() >= dl {
+                        stop.store(true, Ordering::Relaxed);
+                        // Open as writer (O_RDWR) to unblock reader thread.
+                        if let Ok(file) = std::fs::File::options()
+                            .read(true)
+                            .write(true)
+                            .open(input_path)
+                        {
+                            drop(file);
+                        }
+                        let _ = std::fs::remove_file(input_path);
+                        let _ = reader_handle.join();
+                        return Err(format!(
+                            "timed out waiting for writer on '{input_display}'"
+                        ));
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Reader thread exited (FIFO removed or error).
+                break;
+            }
+        }
+    }
+
+    // Cleanup.
+    stop.store(true, Ordering::Relaxed);
+
+    // Open as writer (O_RDWR) to unblock the reader thread.
+    if let Ok(file) = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(input_path)
+    {
+        drop(file);
+    }
+    let _ = std::fs::remove_file(input_path);
+    let _ = reader_handle.join();
+
+    Ok(msg_count)
+}
+
+/// Write data to a FIFO, blocking until a reader is ready.
+///
+/// Spawns a background thread for the blocking open+write so the
+/// caller never hangs. Returns `Ok(bytes_written)` or `Err(message)`.
+fn write_fifo_blocking(path: PathBuf, data: Vec<u8>) -> Result<usize, String> {
+    use std::io::Write;
+
+    if !path.exists() {
+        return Err(format!(
+            "'{}' does not exist (no reader listening)",
+            path.display()
+        ));
+    }
+
+    let n = data.len();
+    let path_display = path.display().to_string();
+    let _ = std::thread::spawn(move || {
+        match std::fs::File::options()
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(&data) {
+                    eprintln!("warning: failed to write to '{}': {e}", path_display);
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: failed to open '{}' for writing: {e}", path_display);
+            }
+        }
+    });
+
+    Ok(n)
+}
+
 pub fn start_linger(path: &Path, _timeout: u64) -> Result<LingerReader, String> {
     create_mcp_fifo(path)?;
 

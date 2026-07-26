@@ -313,3 +313,148 @@ fn broadcast_timeout_zero_blocks_forever() {
     cleanup(&input);
     cleanup(&out1);
 }
+
+// ─── Max-time (-m) tests ───────────────────────────────────────────
+
+/// Broadcast with -m exits cleanly (exit 0) after max-time, even with no writer.
+#[test]
+fn broadcast_max_time_no_writer_exits_cleanly() {
+    let input = fifo_path("bcast_mt_nowriter_input.fifo");
+    let out1 = fifo_path("bcast_mt_nowriter_o1.fifo");
+    cleanup(&input);
+    cleanup(&out1);
+    create_test_fifo(&out1);
+
+    let start = std::time::Instant::now();
+    let mut child = spawn_broadcast(&[
+        "-m", "2",
+        input.to_str().unwrap(),
+        out1.to_str().unwrap(),
+    ]);
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    let elapsed = start.elapsed();
+
+    // -m exits 0, not 124 — it's a hard deadline, not a timeout error.
+    assert_eq!(
+        status.unwrap().code(),
+        Some(0),
+        "should exit 0 on max-time"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "should wait ~2s, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "took too long: {elapsed:?}"
+    );
+    assert!(!input.exists(), "input FIFO should be cleaned up");
+    cleanup(&out1);
+}
+
+/// Broadcast with -m exits cleanly after max-time, even if messages were flowing.
+///
+/// Each write_fifo_blocking opens, writes, and closes the output FIFO,
+/// so we read each message individually by opening the output FIFO
+/// after each write (open blocks until the writer-side thread connects,
+/// then read_to_end returns when the writer closes).
+#[test]
+fn broadcast_max_time_receives_then_exits() {
+    let input = fifo_path("bcast_mt_receive_input.fifo");
+    let out1 = fifo_path("bcast_mt_receive_o1.fifo");
+    cleanup(&input);
+    cleanup(&out1);
+    create_test_fifo(&out1);
+
+    let mut child = spawn_broadcast(&[
+        "-m", "4",
+        input.to_str().unwrap(),
+        out1.to_str().unwrap(),
+    ]);
+
+    // Wait for input FIFO.
+    for _ in 0..50 {
+        if input.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Write first message, then read it.
+    write_fifo(&input, "first message");
+    std::thread::sleep(Duration::from_millis(300));
+    let d1 = read_fifo(&out1);
+    assert_eq!(
+        String::from_utf8_lossy(&d1),
+        "first message\n",
+        "first message mismatch"
+    );
+
+    // Write second message, then read it.
+    write_fifo(&input, "second message");
+    std::thread::sleep(Duration::from_millis(300));
+    let d2 = read_fifo(&out1);
+    assert_eq!(
+        String::from_utf8_lossy(&d2),
+        "second message\n",
+        "second message mismatch"
+    );
+
+    // Wait for process to exit on max-time.
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    assert_eq!(status.unwrap().code(), Some(0), "should exit 0 on max-time");
+
+    assert!(!input.exists(), "input FIFO should be cleaned up");
+    cleanup(&out1);
+}
+
+/// Broadcast with -m 0 behaves same as no -m (blocks forever).
+#[test]
+fn broadcast_max_time_zero_blocks_forever() {
+    let input = fifo_path("bcast_mt_zero_input.fifo");
+    let out1 = fifo_path("bcast_mt_zero_o1.fifo");
+    cleanup(&input);
+    cleanup(&out1);
+    create_test_fifo(&out1);
+
+    let mut child = spawn_broadcast(&[
+        "-m", "0",
+        input.to_str().unwrap(),
+        out1.to_str().unwrap(),
+    ]);
+
+    // Wait for input FIFO.
+    for _ in 0..50 {
+        if input.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Set up output reader.
+    let o1 = out1.clone();
+    let r1 = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::fs::File::options()
+            .read(true)
+            .open(&o1)
+            .unwrap()
+            .read_to_end(&mut buf)
+            .unwrap();
+        buf
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Write after 2 seconds — broadcast should still be alive.
+    std::thread::sleep(Duration::from_secs(2));
+    write_fifo(&input, "still here after delay");
+
+    let d1 = r1.join().unwrap();
+    assert_eq!(d1, b"still here after delay\n", "should receive message after 2s");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    cleanup(&input);
+    cleanup(&out1);
+}
