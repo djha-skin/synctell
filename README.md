@@ -10,6 +10,11 @@ by hand. Because readers create the FIFOs, multiple writers can write to the sam
 reader -- and the FIFO's presence on disk is a clean signal that someone
 is listening for a message.
 
+> **Important:** If a FIFO already exists at the path you specify for
+> `read` or `broadcast`, `synctell` will **refuse** to use it. An
+> existing FIFO means another listener may already own that channel.
+> Clean up stale FIFOs before reading.
+
 ## Installation
 
 ```bash
@@ -478,6 +483,11 @@ called or the handle is dropped.
 > **Note:** The `timeout` parameter on `synctell_read_start_linger` is
 > accepted for forward compatibility but is not yet enforced. The linger
 > reader always blocks until a writer connects or the reader is stopped.
+
+> **Important:** `synctell_read_oneshot` and `synctell_read_start_linger`
+> will **error** if a FIFO already exists at the specified path. An
+> existing FIFO means another listener may own that channel. Delete or
+> reuse the old FIFO path before retrying.
 
 ### Example: configuring in a goose session
 
