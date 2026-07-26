@@ -334,7 +334,8 @@ fn read_oneshot_inner(path: &Path, timeout: u64) -> Result<String, String> {
     }
 }
 
-/// Create a POSIX FIFO.  No-op if it already exists as a FIFO.
+/// Create a POSIX FIFO.  Errors if it already exists (someone else may
+/// own the channel).
 fn create_mcp_fifo(path: &Path) -> Result<(), String> {
     use std::ffi::CString;
     use std::fs;
@@ -356,7 +357,10 @@ fn create_mcp_fifo(path: &Path) -> Result<(), String> {
         let meta = fs::metadata(path)
             .map_err(|e| format!("cannot stat '{}': {e}", path.display()))?;
         if meta.file_type().is_fifo() {
-            return Ok(());
+            return Err(format!(
+                "'{}' already exists as a FIFO — another listener may own this channel",
+                path.display()
+            ));
         }
         return Err(format!("'{}' already exists but is not a FIFO", path.display()));
     }
@@ -1181,6 +1185,44 @@ mod tests {
         assert!(msgs.is_empty());
     }
 
+    // ─── FIFO-exists guard tests ───────────────────────────────────
+
+    #[test]
+    fn test_create_mcp_fifo_rejects_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("existing.fifo");
+
+        // First creation should succeed.
+        create_mcp_fifo(&fifo).unwrap();
+
+        // Second creation should fail — FIFO already exists.
+        let result = create_mcp_fifo(&fifo);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("already exists"),
+            "error should mention existing FIFO: {err}"
+        );
+    }
+
+    #[test]
+    fn test_start_linger_rejects_existing_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("existing_linger.fifo");
+
+        // Create the FIFO directly (simulating another process).
+        make_fifo(tmp.path(), "existing_linger.fifo");
+
+        // start_linger should fail because the FIFO already exists.
+        let result = start_linger(&fifo, 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("already exists"),
+            "error should mention existing FIFO: {err}"
+        );
+    }
+
     // ─── broadcast start/stop tests ───────────────────────────────
 
     #[test]
@@ -1200,11 +1242,12 @@ mod tests {
     fn test_broadcast_fans_out_to_multiple() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("bcast2-in.fifo");
-        let out1 = make_fifo(tmp.path(), "bcast2-out1.fifo");
-        let out2 = make_fifo(tmp.path(), "bcast2-out2.fifo");
-        let out3 = make_fifo(tmp.path(), "bcast2-out3.fifo");
 
-        // Start linger readers for output FIFOs.
+        // Start linger readers for output FIFOs.  start_linger creates the
+        // FIFO *and* begins reading, so no pre-creation is needed.
+        let out1 = tmp.path().join("bcast2-out1.fifo");
+        let out2 = tmp.path().join("bcast2-out2.fifo");
+        let out3 = tmp.path().join("bcast2-out3.fifo");
         let r1 = start_linger(&out1, 0).unwrap();
         let r2 = start_linger(&out2, 0).unwrap();
         let r3 = start_linger(&out3, 0).unwrap();
@@ -1256,7 +1299,7 @@ mod tests {
     fn test_broadcast_tracks_multiple_messages() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("bcast5-in.fifo");
-        let out1 = make_fifo(tmp.path(), "bcast5-out1.fifo");
+        let out1 = tmp.path().join("bcast5-out1.fifo");
 
         let r1 = start_linger(&out1, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -1282,12 +1325,16 @@ mod tests {
     fn test_broadcast_output_reader_disappears_continues() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("bcast6-in.fifo");
-        let out1 = make_fifo(tmp.path(), "bcast6-out1.fifo");
-        let out2 = make_fifo(tmp.path(), "bcast6-out2.fifo");
+        let out1 = tmp.path().join("bcast6-out1.fifo");
+        let out2 = tmp.path().join("bcast6-out2.fifo");
 
+        // Start a lingering reader on out2 (creates the FIFO).
         let r2 = start_linger(&out2, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
 
+        // out1 has NO reader yet — broadcast_start will still find it
+        // via stat in write_fifo_blocking, but writes will block until
+        // a reader appears.  That's OK — the broadcast continues.
         let handle = broadcast_start(&input, &[out1.clone(), out2.clone()], 0, 0).unwrap();
         thread::sleep(Duration::from_millis(50));
 

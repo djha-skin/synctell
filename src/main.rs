@@ -603,13 +603,18 @@ fn create_fifo(path: &Path) -> Result<()> {
 
     let err = io::Error::last_os_error();
 
-    // EEXIST — file already exists; confirm it is actually a FIFO.
+    // EEXIST — file already exists.  We used to treat an existing FIFO
+    // as a no-op, but that's a bug: if someone else already created that
+    // FIFO, they own the channel.  Always reject pre-existing files.
     if err.raw_os_error() == Some(libc::EEXIST) {
         let meta = fs::metadata(path)
             .with_context(|| format!("cannot stat '{}'", path.display()))?;
 
         if meta.file_type().is_fifo() {
-            return Ok(());
+            anyhow::bail!(
+                "'{}' already exists as a FIFO — another listener may own this channel",
+                path.display()
+            );
         }
 
         anyhow::bail!("'{}' already exists but is not a FIFO", path.display());
