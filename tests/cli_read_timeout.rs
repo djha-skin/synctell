@@ -93,6 +93,35 @@ fn read_timeout_no_writer_exits_124() {
     assert!(!path.exists(), "FIFO should be removed after timeout");
 }
 
+/// `synctell read -t 2 -L <fifo>` with no writer → exit 124 (no-linger mode).
+#[test]
+fn read_timeout_no_linger_no_writer_exits_124() {
+    let path = fifo_path("timeout_no_linger.fifo");
+    cleanup(&path);
+
+    let start = std::time::Instant::now();
+    let output = run_read(&["-t", "2", "-L", path.to_str().unwrap()]);
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "should exit 124 on timeout, got {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "should wait for timeout, only took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "took too long: {elapsed:?}"
+    );
+    assert!(!path.exists(), "FIFO should be removed after timeout");
+}
+
 /// `synctell read -t 2 -l <fifo>` with no writer → exit 124.
 #[test]
 fn read_timeout_linger_no_writer_exits_124() {
@@ -122,8 +151,8 @@ fn read_timeout_linger_no_writer_exits_124() {
     assert!(!path.exists(), "FIFO should be removed after timeout");
 }
 
-/// `synctell read -t 0 <fifo>` with no writer → blocks until writer arrives
-/// (treated as no timeout, same as omitting -t).
+/// `synctell read -t 0 -L <fifo>` with no writer → blocks until writer arrives
+/// (treated as no timeout, same as omitting -t, but with oneshot mode).
 #[test]
 fn read_timeout_zero_blocks_forever() {
     let path = fifo_path("timeout_zero.fifo");
@@ -149,7 +178,7 @@ fn read_timeout_zero_blocks_forever() {
         std::io::Write::write_all(&mut file, b"hello from writer").unwrap();
     });
 
-    let output = run_read(&["-t", "0", path.to_str().unwrap()]);
+    let output = run_read(&["-t", "0", "-L", path.to_str().unwrap()]);
     writer.join().unwrap();
 
     assert_eq!(
@@ -170,6 +199,205 @@ fn read_timeout_zero_blocks_forever() {
 }
 
 // ─── Max-time (-m) tests ───────────────────────────────────────────
+
+/// `synctell read <fifo>` (default linger) stays alive for multiple writers.
+#[test]
+fn read_default_linger_multiple_writers() {
+    let path = fifo_path("default_linger.fifo");
+    cleanup(&path);
+
+    let path_clone = path.clone();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..50 {
+            if path_clone.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path_clone.exists(), "FIFO should exist");
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Write first message.
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"first").unwrap();
+        drop(file);
+
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Write second message — default linger should receive it.
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"second").unwrap();
+    });
+
+    // Run read with no -l flag (default linger = on).
+    let output = run_read(&["-m", "6", path.to_str().unwrap()]);
+    writer.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0, got {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("first"),
+        "should have received first message: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("second"),
+        "should have received second message (default linger): {stdout:?}"
+    );
+
+    assert!(!path.exists(), "FIFO should be removed");
+}
+
+/// `synctell read -L <fifo>` exits after the first message (no linger).
+#[test]
+fn read_no_linger_exits_after_one() {
+    let path = fifo_path("no_linger.fifo");
+    cleanup(&path);
+
+    let path_clone = path.clone();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..50 {
+            if path_clone.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path_clone.exists(), "FIFO should exist");
+        std::thread::sleep(Duration::from_millis(100));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"only one").unwrap();
+    });
+
+    // -L = no linger, should exit after one message.
+    let output = run_read(&["-L", path.to_str().unwrap()]);
+    writer.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0, got {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("only one"),
+        "should contain the message: {stdout:?}"
+    );
+
+    assert!(!path.exists(), "FIFO should be removed");
+}
+
+/// `synctell read -l -L <fifo>` — last flag wins: -L means no-linger.
+#[test]
+fn read_linger_then_no_linger_last_wins() {
+    let path = fifo_path("linger_then_no_linger.fifo");
+    cleanup(&path);
+
+    let path_clone = path.clone();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..50 {
+            if path_clone.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path_clone.exists(), "FIFO should exist");
+        std::thread::sleep(Duration::from_millis(100));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"only one").unwrap();
+    });
+
+    // -l then -L — last one wins, so no-linger.
+    let output = run_read(&["-l", "-L", path.to_str().unwrap()]);
+    writer.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0, got {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("only one"),
+        "should contain the message: {stdout:?}"
+    );
+
+    assert!(!path.exists(), "FIFO should be removed");
+}
+
+/// `synctell read -L -l <fifo>` — last flag wins: -l means linger.
+#[test]
+fn read_no_linger_then_linger_last_wins() {
+    let path = fifo_path("no_linger_then_linger.fifo");
+    cleanup(&path);
+
+    let path_clone = path.clone();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..50 {
+            if path_clone.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(path_clone.exists(), "FIFO should exist");
+        std::thread::sleep(Duration::from_millis(100));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"first").unwrap();
+        drop(file);
+        std::thread::sleep(Duration::from_millis(200));
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(&path_clone)
+            .unwrap();
+        std::io::Write::write_all(&mut file, b"second").unwrap();
+    });
+
+    // -L then -l — last one wins, so linger.
+    let output = run_read(&["-L", "-l", "-m", "6", path.to_str().unwrap()]);
+    writer.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "should exit 0, got {:?}",
+        output.status.code()
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("first"),
+        "should contain first message: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("second"),
+        "should contain second message (linger): {stdout:?}"
+    );
+
+    assert!(!path.exists(), "FIFO should be removed");
+}
 
 /// `synctell read -m 2 <fifo>` with no writer → exits after ~2s (exit 0, no data).
 /// Unlike -t, -m is a hard deadline: exit 0 even if no writer connects.
@@ -255,7 +483,7 @@ fn read_max_time_linger_receives_then_exits() {
     assert!(!path.exists(), "FIFO should be removed");
 }
 
-/// `synctell read -m 0 <fifo>` behaves same as no -m (blocks forever).
+/// `synctell read -m 0 -L <fifo>` behaves same as no -m (blocks forever).
 #[test]
 fn read_max_time_zero_blocks_forever() {
     let path = fifo_path("max_time_zero.fifo");
@@ -278,7 +506,7 @@ fn read_max_time_zero_blocks_forever() {
         std::io::Write::write_all(&mut file, b"hello after wait").unwrap();
     });
 
-    let output = run_read(&["-m", "0", path.to_str().unwrap()]);
+    let output = run_read(&["-m", "0", "-L", path.to_str().unwrap()]);
     writer.join().unwrap();
 
     assert_eq!(

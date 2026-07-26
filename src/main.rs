@@ -43,9 +43,13 @@ enum Commands {
         /// Path for the FIFO to create
         path: PathBuf,
 
-        /// Keep reading after the first message
-        #[arg(short = 'l', long = "linger")]
+        /// Keep reading after the first message (default: linger on)
+        #[arg(short = 'l', long = "linger", overrides_with = "oneshot")]
         linger: bool,
+
+        /// Turn off linger — exit after one message
+        #[arg(short = 'L', long = "oneshot", overrides_with = "linger")]
+        oneshot: bool,
 
         /// Seconds to wait for the first writer (0 = block forever)
         #[arg(short = 't', long = "timeout", value_name = "SECS")]
@@ -89,6 +93,25 @@ enum Commands {
 
     /// Start an MCP server over stdio
     Mcp,
+
+    /// Round-robin: read from one FIFO, distribute messages round-robin to outputs
+    #[command(alias = "rr", alias = "roundrobin")]
+    RoundRobin {
+        /// Path for the input FIFO to create
+        input: PathBuf,
+
+        /// Paths to output FIFOs (must already exist)
+        #[arg(required = true, num_args = 1..)]
+        outputs: Vec<PathBuf>,
+
+        /// Seconds to wait for the first writer (0 = block forever)
+        #[arg(short = 't', long = "timeout", value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Hard deadline: quit after N seconds no matter what (0 = no limit)
+        #[arg(short = 'm', long = "max-time", value_name = "SECS")]
+        max_time: Option<u64>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,9 +127,15 @@ fn main() -> Result<()> {
         Commands::Read {
             path,
             linger,
+            oneshot,
             timeout,
             max_time,
-        } => cmd_input(&path, timeout, linger, max_time),
+        } => {
+            // Default: linger ON. -l sets linger=true, -L sets oneshot=true.
+            // Last one wins via overrides_with.
+            let effective_linger = linger || !oneshot;
+            cmd_input(&path, timeout, effective_linger, max_time)
+        }
         Commands::Write {
             path,
             timeout,
@@ -123,6 +152,12 @@ fn main() -> Result<()> {
             timeout,
             max_time,
         } => cmd_broadcast(&input, &outputs, timeout, max_time),
+        Commands::RoundRobin {
+            input,
+            outputs,
+            timeout,
+            max_time,
+        } => cmd_roundrobin(&input, &outputs, timeout, max_time),
     }
 }
 
@@ -250,9 +285,9 @@ enum ReadResult {
 /// Creates a FIFO at `path` and reads from it.
 /// The FIFO's presence on disk signals that a reader is listening.
 ///
-/// - Without `--linger`, reads one message then exits.
-/// - With `--linger`, stays alive reading from one or more writers
-///   until interrupted by a signal.
+/// - By default (no flags), stays alive reading from one or more writers
+///   until interrupted by a signal (linger is ON).
+/// - With `-L` (`--no-linger`), reads one message then exits.
 ///
 /// - Without a timeout, blocks until a writer appears.
 /// - With a timeout, waits at most `secs` seconds for the first
@@ -571,6 +606,143 @@ fn cmd_broadcast(
     // a FIFO regardless of whether a reader is connected, which
     // unblocks the reader's O_RDONLY open(). Once the reader sees the
     // stop flag, it exits.
+    if let Ok(file) = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(input_path)
+    {
+        drop(file);
+    }
+
+    let _ = fs::remove_file(input_path);
+    let _ = reader_handle.join();
+
+    Ok(())
+}
+
+// ─── Round-robin mode ─────────────────────────────────────────────
+
+/// Round-robin mode: create an input FIFO, read messages, distribute
+/// them one at a time across output FIFOs in round-robin order.
+///
+/// Linger is implicitly always on for the input.
+/// `-t N` timeout governs the wait for the first writer only — once
+/// a message arrives the timeout is discarded.
+/// Output FIFOs must already exist; missing ones are skipped per-write.
+/// The input FIFO is removed on exit.
+fn cmd_roundrobin(
+    input_path: &Path,
+    output_paths: &[PathBuf],
+    timeout: Option<u64>,
+    max_time: Option<u64>,
+) -> Result<()> {
+    if output_paths.is_empty() {
+        anyhow::bail!("round-robin requires at least one output FIFO");
+    }
+
+    create_fifo(input_path)?;
+
+    let input_display = input_path.display().to_string();
+
+    // Set up a channel: reader thread → roundrobin loop.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let input_clone = input_path.to_path_buf();
+
+    // Reader thread: loops blocking on open → read_to_end → send.
+    let reader_handle = thread::Builder::new()
+        .name(format!("roundrobin-reader-{input_display}"))
+        .spawn(move || {
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut file = match fs::File::open(&input_clone) {
+                    Ok(f) => f,
+                    Err(_) => return, // FIFO removed — exit.
+                };
+                let mut data = Vec::new();
+                if file.read_to_end(&mut data).is_err() {
+                    return;
+                }
+                drop(file);
+                if data.is_empty() {
+                    continue;
+                }
+                if tx.send(data).is_err() {
+                    return;
+                }
+            }
+        })
+        .context("failed to spawn round-robin reader thread")?;
+
+    let deadline = timeout
+        .filter(|&s| s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
+
+    let max_deadline = max_time
+        .filter(|&s| s > 0)
+        .map(|s| Instant::now() + Duration::from_secs(s));
+
+    let mut next_output = 0usize;
+    let n_outputs = output_paths.len();
+
+    // Main loop: receive messages from the reader and dispatch round-robin.
+    loop {
+        if let Some(dl) = max_deadline
+            && Instant::now() >= dl
+        {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(data) => {
+                let mut msg = data;
+                if msg.last() != Some(&b'\n') {
+                    msg.push(b'\n');
+                }
+
+                // Send to current output, then advance.
+                let idx = next_output % n_outputs;
+                next_output = next_output.wrapping_add(1);
+                let out = &output_paths[idx];
+
+                if let Err(e) = write_fifo_blocking(out.clone(), msg) {
+                    eprintln!("warning: {e}");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        stop.store(true, Ordering::Relaxed);
+                        if let Ok(file) = std::fs::File::options()
+                            .read(true)
+                            .write(true)
+                            .open(input_path)
+                        {
+                            drop(file);
+                        }
+                        let _ = fs::remove_file(input_path);
+                        let _ = reader_handle.join();
+                        eprintln!(
+                            "error: timed out waiting for writer on '{input_display}'"
+                        );
+                        std::process::exit(124);
+                    }
+                }
+                if QUIT.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    // Cleanup.
+    stop.store(true, Ordering::Relaxed);
+
     if let Ok(file) = std::fs::File::options()
         .read(true)
         .write(true)

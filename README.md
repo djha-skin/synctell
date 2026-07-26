@@ -25,9 +25,10 @@ cargo install synctell
 
 | Command       | Description |
 |---------------|-------------|
-| `synctell read`  | Create a FIFO and read messages from writers |
+| `synctell read`  | Create a FIFO and read messages from writers (linger on by default) |
 | `synctell write` | Poll for a FIFO and write a message to it |
 | `synctell broadcast` | Read from one FIFO, write to many |
+| `synctell roundrobin` / `synctell rr` | Read from one FIFO, distribute messages round-robin to outputs |
 | `synctell mcp`   | Start an MCP server over stdio |
 
 ## Usage
@@ -35,11 +36,11 @@ cargo install synctell
 ### Read
 
 ```bash
-# Read a single message from a FIFO (creates it, reads one message, exits)
+# Read messages from a FIFO (creates it, stays alive for multiple writers by default)
 synctell read my-fifo
 
-# Read many messages — stay alive for multiple writers until SIGINT
-synctell read -l my-fifo
+# Read one message and exit (oneshot mode — no linger)
+synctell read -L my-fifo
 
 # Read with a timeout — exit 124 if no writer connects in 5 seconds
 synctell read -t 5 my-fifo
@@ -47,8 +48,8 @@ synctell read -t 5 my-fifo
 # Read with a hard max-time — exit 0 after 10 seconds no matter what
 synctell read -m 10 my-fifo
 
-# Linger with max-time — receive messages for 10 seconds, then exit cleanly
-synctell read -l -m 10 my-fifo
+# Oneshot with max-time — receive one message or exit cleanly after 10 seconds
+synctell read -L -m 10 my-fifo
 ```
 
 ### Write
@@ -83,16 +84,18 @@ synctell broadcast -m 30 input.fifo output1.fifo
 
 | Flag | Applies to | Description |
 |------|-----------|-------------|
-| `-l` / `--linger` | read | Keep reading after the first message (stay alive for multiple writers) |
-| `-t` / `--timeout` SECS | read, write, broadcast | Wait at most N seconds for the first peer. Exit 124 if none. Discarded once first message arrives. 0 = block forever. |
-| `-m` / `--max-time` SECS | read, broadcast | Hard deadline — quit after N seconds no matter what. Never discarded. Exit 0. 0 = no limit. |
+| `-L` / `--oneshot` | read | Exit after one message (turn off default linger). Last flag wins with `-l`. |
+| `-l` / `--linger` | read | (deprecated) Keep reading after the first message. Redundant since linger is now the default. Last flag wins with `-L`. |
+| `-t` / `--timeout` SECS | read, write, broadcast, roundrobin | Wait at most N seconds for the first peer. Exit 124 if none. Discarded once first message arrives. 0 = block forever. |
+| `-m` / `--max-time` SECS | read, broadcast, roundrobin | Hard deadline — quit after N seconds no matter what. Never discarded. Exit 0. 0 = no limit. |
 
 ## Examples
 
 ### Pipe between two shells
 
-The reader (`read`) creates the FIFO and reads one message, then exits.
-The writer (`write`) waits for the FIFO to appear, opens it, writes, and exits.
+The reader (`read`) creates the FIFO and reads messages. By default it stays
+alive for multiple writers. The writer (`write`) waits for the FIFO to appear,
+opens it, writes, and exits.
 
 **Shell 1** (reader — start this first, or concurrently with `-t` on the
 writer):
@@ -105,13 +108,13 @@ synctell read my-fifo
 synctell write my-fifo "the answer is 42"
 ```
 
-Shell 1 prints `the answer is 42` and exits. The writer exits as soon as its
-message is delivered.
+Shell 1 prints `the answer is 42` and keeps listening for more writers.
+The writer exits as soon as its message is delivered.
 
-To accept **multiple** messages from different writers, add `-l`:
+To accept **one** message only, use `-L`:
 
 ```bash
-synctell read -l my-fifo
+synctell read -L my-fifo
 ```
 
 > **Note:** Without a timeout (`-t`), the writer exits immediately with
@@ -129,12 +132,12 @@ synctell read -l my-fifo
 synctell write -t 3 my-fifo "are you there?"
 
 # Reader: exit 124 after 3 seconds if no writer shows up.
-# Without -l, exits after the first message.
+# Default linger is on, so after the first message it stays alive.
 synctell read -t 3 my-fifo
 
-# Reader (linger mode): exit 124 after 3 seconds if no writer shows up.
-# Once one writer has connected, the reader stays alive indefinitely.
-synctell read -l -t 3 my-fifo
+# Reader (oneshot mode): exit 124 after 3 seconds if no writer shows up.
+# Exits after the first message.
+synctell read -L -t 3 my-fifo
 ```
 
 ### With max-time
@@ -143,8 +146,8 @@ synctell read -l -t 3 my-fifo
 # Reader: exit 0 after 10 seconds, even if no writer connects
 synctell read -m 10 my-fifo
 
-# Reader (linger): receive messages for up to 10 seconds, then exit cleanly
-synctell read -l -m 10 my-fifo
+# Reader (default linger): receive messages for up to 10 seconds, then exit cleanly
+synctell read -m 10 my-fifo
 
 # Broadcast: fan out messages for up to 30 seconds, then exit cleanly
 synctell broadcast -m 30 input.fifo output1.fifo output2.fifo
@@ -152,14 +155,14 @@ synctell broadcast -m 30 input.fifo output1.fifo output2.fifo
 
 ### Multiple writers, one reader
 
-A single reader with `-l` accepts messages from any number of writers.
+A single reader (default linger on) accepts messages from any number of writers.
 Each message arrives as a separate chunk on the reader's stdout. If a
 writer's data doesn't end with a newline, the reader appends one — so
 writers that send plain messages line up neatly on the receiver's output:
 
 ```bash
 # Terminal 1: one reader, listening until interrupted
-synctell read -l inbox.fifo
+synctell read inbox.fifo
 
 # Terminal 2, 3, 4: many writers, each delivering a message
 synctell write inbox.fifo "from agent-a"
@@ -185,11 +188,11 @@ to every output FIFO. Linger is automatic — the broadcast stays alive for
 multiple writers. Output FIFOs must already exist (their readers created them).
 
 ```bash
-# Terminal 1: output reader A
-synctell read -l output-a.fifo
+# Terminal 1: output reader A (default linger stays alive)
+synctell read output-a.fifo
 
-# Terminal 2: output reader B
-synctell read -l output-b.fifo
+# Terminal 2: output reader B (default linger stays alive)
+synctell read output-b.fifo
 
 # Terminal 3: broadcast (must start after output FIFOs exist)
 synctell broadcast input.fifo output-a.fifo output-b.fifo
@@ -222,7 +225,7 @@ Start the writer in the background — it waits for the FIFO to appear
 cat big-file.csv | synctell write data-pipe &
 
 # Reader: creates the FIFO, consumes stdin from each writer, streams to stdout
-synctell read -l data-pipe | sort | uniq -c > result.txt
+synctell read data-pipe | sort | uniq -c > result.txt
 
 wait
 ```
@@ -270,7 +273,7 @@ deliver to existing FIFOs. This has two useful properties:
 
 ```bash
 # Agent B — reader (creates inbox.fifo, listens for messages)
-synctell read -l agent-b/inbox.fifo
+synctell read agent-b/inbox.fifo
 ```
 
 ```bash
@@ -306,8 +309,8 @@ filesystem, visible to every agent that has directory access. You can
 `ls` it, `stat` it, `rm` it. It is as simple as messaging gets.
 
 **5. Predictable lifecycle.** The reader creates the FIFO, accepts
-messages, and removes the FIFO when it exits. With `-l`, it stays alive
-for multiple writers; without `-l`, it exits after the first message.
+messages, and removes the FIFO when it exits. By default it stays alive
+for multiple writers; with `-L` / `--oneshot`, it exits after the first message.
 Writers poll for the FIFO, write, and exit. Agents can coordinate by
 agreeing on FIFO paths — the path itself is the protocol.
 
@@ -332,8 +335,8 @@ wait
 ```
 
 Each `read` creates a FIFO, reads input, and removes the FIFO on exit.
-With `-l`, a reader stays alive for multiple writers; without `-l`,
-it exits after the first message.
+By default, a reader stays alive for multiple writers (linger on);
+with `-L`, it exits after the first message (oneshot).
 Each `write` polls for the FIFO, writes, exits. The polling writer blocks
 until the upstream reader has created the FIFO, providing natural
 backpressure between stages.
@@ -344,7 +347,7 @@ Many agents reporting into a single observer:
 
 ```bash
 # Observer: one reader, accepts reports from any number of agents
-synctell read -l reports.fifo | tee -a /var/log/agents.log &
+synctell read reports.fifo | tee -a /var/log/agents.log &
 ```
 
 ```bash
@@ -358,8 +361,8 @@ The observer's log grows line by line, with each report arriving as
 soon as its writer connects. No need for a broker, a log-collector
 daemon, or a network socket — just a FIFO.
 
-> **Note:** Without `-l`, the reader exits after the first report.
-> Use `-l` when you expect multiple writers to report over time.
+> **Note:** Linger is on by default, so the reader stays alive for multiple reports.
+> Use `-L` to exit after the first report.
 
 ### Example: fan-out (one input → many outputs)
 
@@ -367,10 +370,10 @@ Use `synctell broadcast` to distribute a message to multiple agents:
 
 ```bash
 # Agent A: broadcast listener for pipeline updates
-synctell read -l build-status-a.fifo | process-status
+synctell read build-status-a.fifo | process-status
 
 # Agent B: another broadcast listener
-synctell read -l build-status-b.fifo | process-status
+synctell read build-status-b.fifo | process-status
 
 # Coordinator: broadcast to all listeners
 synctell broadcast input.fifo build-status-a.fifo build-status-b.fifo
@@ -395,10 +398,10 @@ reading, which returns only once a writer has connected; it reads the
 message to EOF, writes the bytes (plus a trailing newline if the writer's
 data didn't already end with one) to stdout, and then:
 
-- **Without `-l`** (default): exits after the first message.
-- **With `-l`**: goes back to waiting for the next writer, discarding any
-  timeout. This continues until a SIGINT or SIGTERM sets a shutdown flag
+- **Default** (linger on): goes back to waiting for the next writer.
+  This continues until a SIGINT or SIGTERM sets a shutdown flag
   that the read loop checks once per second.
+- **With `-L` / `--oneshot`**: exits after the first message.
 
 ### Write mode
 
@@ -419,15 +422,26 @@ broadcast stays alive for multiple writers. If an output FIFO's reader
 disappears, the broadcast logs a warning and continues to remaining
 outputs.
 
+### Round-robin mode
+
+In round-robin mode (`synctell roundrobin` / `synctell rr`), `synctell`
+creates an input FIFO (same as `broadcast`) and spawns a reader thread.
+The main loop receives messages from the channel and distributes them
+one at a time to the output FIFOs in round-robin order — each message
+goes to exactly one output, rotating through the list. If an output
+FIFO's reader has disappeared, that output is skipped per-message with
+a warning, and the next output in the rotation gets the message.
+
 ### Timeout and max-time
 
 When a timeout is specified (`-t`), write mode polls once per second
 for the FIFO's existence. If the FIFO has not appeared by the deadline,
 the process exits with code **124**. Read mode, on timeout without any
 writer ever connecting, also removes the FIFO it created and exits with
-code **124**. In linger mode (`-l`), once a reader has received at least
+code **124**. By default (linger on), once a reader has received at least
 one message, it stays alive indefinitely — the timeout only governs the
-wait for the *first* writer.
+wait for the *first* writer. Use `-L` / `--oneshot` to exit after the
+first message.
 
 When max-time is specified (`-m`), it acts as a hard deadline. Unlike
 timeout, it is never discarded — the process exits cleanly with code **0**
@@ -470,6 +484,8 @@ agent framework).
 | `synctell_read_stop_linger` | Stop a lingering reader, return buffered data | `path` (string) |
 | `synctell_broadcast_start` | Start a broadcast: create an input FIFO and begin fanning out messages to multiple output FIFOs. Runs in background. | `path` (string), `outputs` (string array), `timeout` (integer, optional), `max_time` (integer, optional) |
 | `synctell_broadcast_stop` | Stop a broadcast, clean up the input FIFO, and return the number of messages broadcast | `path` (string) |
+| `synctell_roundrobin_start` | Start a round-robin: create an input FIFO and begin distributing messages to output FIFOs round-robin. Runs in background. | `path` (string), `outputs` (string array), `timeout` (integer, optional), `max_time` (integer, optional) |
+| `synctell_roundrobin_stop` | Stop a round-robin, clean up the input FIFO, and return the number of messages distributed | `path` (string) |
 
 ### Timeout semantics
 
@@ -523,6 +539,18 @@ call.
    Each message is fanned out to all output FIFOs (best-effort).
 4. Call `synctell_broadcast_stop` to stop the broadcast, clean up the
    input FIFO, and return the count of messages broadcast.
+5. Stop linger readers with `synctell_read_stop_linger`.
+
+### Round-robin example
+
+1. Create output FIFOs using `synctell_read_start_linger` for each
+   round-robin receiver.
+2. Call `synctell_roundrobin_start` with the input path and output path
+   list. The round-robin begins accepting writers in the background.
+3. Use `synctell_write` to deliver messages to the round-robin input FIFO.
+   Each message is distributed to exactly one output FIFO in order.
+4. Call `synctell_roundrobin_stop` to stop the round-robin, clean up the
+   input FIFO, and return the count of messages distributed.
 5. Stop linger readers with `synctell_read_stop_linger`.
 
 ## Exit Codes

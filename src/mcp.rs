@@ -63,6 +63,26 @@ pub struct BroadcastStopRequest {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+pub struct RoundRobinStartRequest {
+    /// Path for the input FIFO to create
+    pub path: PathBuf,
+    /// Paths to output FIFOs (must already exist)
+    pub outputs: Vec<PathBuf>,
+    /// Seconds to wait for first writer (0 = block forever, default).
+    #[serde(default)]
+    pub timeout: u64,
+    /// Hard deadline: quit after N seconds no matter what (0 = no limit, default).
+    #[serde(default)]
+    pub max_time: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, JsonSchema)]
+pub struct RoundRobinStopRequest {
+    /// Path of the input FIFO to stop
+    pub path: PathBuf,
+}
+
 // ─── MCP server handler ───────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -73,6 +93,8 @@ pub struct SynctellServer {
     readers: Arc<Mutex<HashMap<PathBuf, LingerReader>>>,
     /// Active broadcasters keyed by input FIFO path.
     broadcasters: Arc<Mutex<HashMap<PathBuf, BroadcastHandle>>>,
+    /// Active roundrobiners keyed by input FIFO path.
+    roundrobins: Arc<Mutex<HashMap<PathBuf, RoundRobinHandle>>>,
 }
 
 impl SynctellServer {
@@ -81,6 +103,7 @@ impl SynctellServer {
             tool_router: Self::tool_router(),
             readers: Arc::new(Mutex::new(HashMap::new())),
             broadcasters: Arc::new(Mutex::new(HashMap::new())),
+            roundrobins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -189,6 +212,38 @@ impl SynctellServer {
             .ok_or_else(|| format!("no linger reader found for '{}'", path.display()))?;
         let msg = reader.pop_message(timeout)?;
         Ok(msg)
+    }
+
+    #[tool(description = "Start a round-robin: create an input FIFO and begin distributing messages round-robin to multiple output FIFOs. Runs in the background. Call synctell_roundrobin_stop to stop it and get the count.")]
+    fn synctell_roundrobin_start(
+        &self,
+        Parameters(RoundRobinStartRequest { path, outputs, timeout, max_time }): Parameters<RoundRobinStartRequest>,
+    ) -> Result<String, String> {
+        let mut roundrobins = self.roundrobins.lock().unwrap();
+        if roundrobins.contains_key(&path) {
+            return Err(format!(
+                "round-robin already active for '{}'",
+                path.display()
+            ));
+        }
+        let handle = roundrobin_start(&path, &outputs, timeout, max_time)?;
+        roundrobins.insert(path.clone(), handle);
+        Ok(format!("round-robin started at '{}'", path.display()))
+    }
+
+    #[tool(description = "Stop a round-robin, clean up the input FIFO, and return the number of messages distributed")]
+    fn synctell_roundrobin_stop(
+        &self,
+        Parameters(RoundRobinStopRequest { path }): Parameters<RoundRobinStopRequest>,
+    ) -> Result<String, String> {
+        let handle = self
+            .roundrobins
+            .lock()
+            .unwrap()
+            .remove(&path)
+            .ok_or_else(|| format!("no round-robin found for '{}'", path.display()))?;
+        let count = handle.stop()?;
+        Ok(format!("round-robin {count} message(s)"))
     }
 }
 
@@ -808,6 +863,158 @@ pub fn broadcast_start(
         .map_err(|e| format!("failed to spawn broadcast thread: {e}"))?;
 
     Ok(BroadcastHandle {
+        stop,
+        msg_count,
+        handle: Some(handle),
+        path: input_path.to_path_buf(),
+    })
+}
+
+// ─── RoundRobin start/stop ───────────────────────────────────────
+
+/// Handle to a running round-robin.
+pub struct RoundRobinHandle {
+    stop: Arc<AtomicBool>,
+    msg_count: Arc<std::sync::atomic::AtomicUsize>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for RoundRobinHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoundRobinHandle")
+            .field("path", &self.path)
+            .field("running", &self.handle.is_some())
+            .finish()
+    }
+}
+
+impl RoundRobinHandle {
+    /// Stop the round-robin, clean up the input FIFO, and return the number of messages distributed.
+    pub fn stop(mut self) -> Result<usize, String> {
+        self.stop.store(true, Ordering::Relaxed);
+
+        // Open as writer (O_RDWR) to unblock the reader thread blocked on open().
+        if let Ok(file) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+        {
+            drop(file);
+        }
+
+        // Remove the FIFO — subsequent open() calls will fail with ENOENT.
+        let _ = std::fs::remove_file(&self.path);
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+
+        Ok(self.msg_count.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for RoundRobinHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+
+        // Open as writer (O_RDWR) to unblock reader thread.
+        if let Ok(file) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+        {
+            drop(file);
+        }
+
+        // Remove FIFO.
+        let _ = std::fs::remove_file(&self.path);
+
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Start a round-robin: create an input FIFO and start a background reader
+/// that distributes messages round-robin across output FIFOs.
+///
+/// Output FIFOs must already exist; missing ones are skipped per-write
+/// (a warning is logged to stderr).
+///
+/// Returns a `RoundRobinHandle`. Call `.stop()` to stop the round-robin and
+/// retrieve the number of messages distributed. The input FIFO is cleaned
+/// up on stop (or drop).
+pub fn roundrobin_start(
+    input_path: &Path,
+    output_paths: &[PathBuf],
+    _timeout: u64,
+    _max_time: u64,
+) -> Result<RoundRobinHandle, String> {
+    if output_paths.is_empty() {
+        return Err("round-robin requires at least one output FIFO".to_string());
+    }
+
+    create_mcp_fifo(input_path)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let msg_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let outputs: Vec<PathBuf> = output_paths.to_vec();
+    let n_outputs = outputs.len();
+
+    let stop_clone = stop.clone();
+    let msg_count_clone = msg_count.clone();
+    let path_buf = input_path.to_path_buf();
+    let path_display = input_path.display().to_string();
+
+    let handle = std::thread::Builder::new()
+        .name(format!("roundrobin-{path_display}"))
+        .spawn(move || {
+            let mut next_output = 0usize;
+            loop {
+                if stop_clone.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                // Blocking open() — waits for a writer.
+                let mut file = match std::fs::File::open(&path_buf) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        // FIFO was removed — exit.
+                        return;
+                    }
+                };
+
+                let mut data = Vec::new();
+                if let Err(_) = file.read_to_end(&mut data) {
+                    return;
+                }
+                drop(file);
+
+                if data.is_empty() {
+                    continue;
+                }
+
+                // Ensure trailing newline.
+                if data.last() != Some(&b'\n') {
+                    data.push(b'\n');
+                }
+
+                // Dispatch to the next output in round-robin order.
+                let idx = next_output % n_outputs;
+                next_output = next_output.wrapping_add(1);
+                let out = &outputs[idx];
+
+                if let Err(e) = write_fifo_blocking(out.clone(), data) {
+                    eprintln!("warning: {e}");
+                }
+
+                msg_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .map_err(|e| format!("failed to spawn round-robin thread: {e}"))?;
+
+    Ok(RoundRobinHandle {
         stop,
         msg_count,
         handle: Some(handle),

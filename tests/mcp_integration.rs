@@ -468,6 +468,187 @@ fn test_oneshot_roundtrip() {
     assert!(!path.exists(), "FIFO should be removed after oneshot read");
 }
 
+// ─── Round-robin MCP tests ────────────────────────────────────────
+
+/// Test that roundrobin_start creates a FIFO and roundrobin_stop cleans up.
+#[test]
+fn test_roundrobin_creates_fifo() {
+    let mut client = McpClient::spawn();
+    let path = fifo_path("test_rr_create.fifo");
+    let out1 = fifo_path("test_rr_create_out1.fifo");
+    cleanup(&path);
+    cleanup(&out1);
+    // Create output FIFO with a linger reader.
+    let result = client.call_tool(
+        "synctell_read_start_linger",
+        serde_json::json!({
+            "path": out1,
+        }),
+    );
+    assert!(result.is_ok(), "start_linger for out1: {:?}", result);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let result = client.call_tool(
+        "synctell_roundrobin_start",
+        serde_json::json!({
+            "path": path,
+            "outputs": [out1],
+        }),
+    );
+    assert!(result.is_ok(), "roundrobin_start: {:?}", result);
+    assert!(path.exists(), "FIFO should exist after roundrobin_start");
+
+    // Stop.
+    let result = client.call_tool(
+        "synctell_roundrobin_stop",
+        serde_json::json!({
+            "path": path,
+        }),
+    );
+    assert!(result.is_ok(), "roundrobin_stop: {:?}", result);
+    assert!(!path.exists(), "FIFO should be removed after stop");
+
+    // Clean up output linger.
+    let _ = client.call_tool(
+        "synctell_read_stop_linger",
+        serde_json::json!({
+            "path": out1,
+        }),
+    );
+}
+
+/// Test roundrobin distributes messages round-robin via MCP.
+#[test]
+fn test_roundrobin_distributes_round_robin() {
+    let mut client = McpClient::spawn();
+    let input = fifo_path("test_rr_dist_input.fifo");
+    let out1 = fifo_path("test_rr_dist_out1.fifo");
+    let out2 = fifo_path("test_rr_dist_out2.fifo");
+    cleanup(&input);
+    cleanup(&out1);
+    cleanup(&out2);
+
+    // Start linger readers for output FIFOs.
+    let _ = client.call_tool(
+        "synctell_read_start_linger",
+        serde_json::json!({ "path": out1 }),
+    );
+    let _ = client.call_tool(
+        "synctell_read_start_linger",
+        serde_json::json!({ "path": out2 }),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Start roundrobin.
+    let result = client.call_tool(
+        "synctell_roundrobin_start",
+        serde_json::json!({
+            "path": input,
+            "outputs": [out1, out2],
+        }),
+    );
+    assert!(result.is_ok(), "roundrobin_start: {:?}", result);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Write messages.
+    let _ = client.call_tool(
+        "synctell_write",
+        serde_json::json!({ "path": input, "message": "msg1" }),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = client.call_tool(
+        "synctell_write",
+        serde_json::json!({ "path": input, "message": "msg2" }),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = client.call_tool(
+        "synctell_write",
+        serde_json::json!({ "path": input, "message": "msg3" }),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Stop roundrobin.
+    let result = client.call_tool(
+        "synctell_roundrobin_stop",
+        serde_json::json!({ "path": input }),
+    );
+    assert!(result.is_ok(), "roundrobin_stop: {:?}", result);
+    assert!(result.unwrap().contains("3"), "should have distributed 3 messages");
+
+    // Collect from output linger readers.
+    let r1 = client.call_tool(
+        "synctell_read_stop_linger",
+        serde_json::json!({ "path": out1 }),
+    );
+    let r2 = client.call_tool(
+        "synctell_read_stop_linger",
+        serde_json::json!({ "path": out2 }),
+    );
+
+    // msg1 → out1, msg2 → out2, msg3 → out1
+    let d1 = r1.unwrap_or_default();
+    let d2 = r2.unwrap_or_default();
+    assert!(d1.contains("msg1"), "out1 should have msg1: {d1:?}");
+    assert!(d1.contains("msg3"), "out1 should have msg3: {d1:?}");
+    assert!(d2.contains("msg2"), "out2 should have msg2: {d2:?}");
+}
+
+/// Test roundrobin rejects duplicate start.
+#[test]
+fn test_roundrobin_rejects_duplicate() {
+    let mut client = McpClient::spawn();
+    let path = fifo_path("test_rr_dup.fifo");
+    let out1 = fifo_path("test_rr_dup_out1.fifo");
+    cleanup(&path);
+    cleanup(&out1);
+    let _ = client.call_tool(
+        "synctell_read_start_linger",
+        serde_json::json!({ "path": out1 }),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    let result = client.call_tool(
+        "synctell_roundrobin_start",
+        serde_json::json!({ "path": path, "outputs": [out1.clone()] }),
+    );
+    assert!(result.is_ok(), "first roundrobin_start: {:?}", result);
+
+    // Second start on same path should fail.
+    let result = client.call_tool(
+        "synctell_roundrobin_start",
+        serde_json::json!({ "path": path, "outputs": [out1] }),
+    );
+    assert!(result.is_err(), "duplicate roundrobin_start should error");
+    assert!(
+        result.unwrap_err().contains("already active"),
+        "error should mention already active"
+    );
+
+    // Clean up.
+    let _ = client.call_tool(
+        "synctell_roundrobin_stop",
+        serde_json::json!({ "path": path }),
+    );
+}
+
+/// Test roundrobin stop on unknown path errors.
+#[test]
+fn test_roundrobin_stop_invalid() {
+    let mut client = McpClient::spawn();
+    let path = fifo_path("test_rr_stop_invalid.fifo");
+    cleanup(&path);
+
+    let result = client.call_tool(
+        "synctell_roundrobin_stop",
+        serde_json::json!({ "path": path }),
+    );
+    assert!(result.is_err(), "stop on unknown path should error");
+    assert!(
+        result.unwrap_err().contains("no round-robin"),
+        "error should mention no round-robin"
+    );
+}
+
 /// Write to a FIFO directly (used by the roundtrip test helper).
 fn write_to_fifo_direct(path: &std::path::Path, message: &str) -> Result<usize, String> {
     use std::io::Write;
