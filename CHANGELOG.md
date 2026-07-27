@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] — 2026-07-26
+
+### Added
+
+- **Actor skill** (`.agents/skills/actor/SKILL.md`): a complete skill
+  for multi-agent work networks using `synctell` FIFO mailboxes.
+  Supports autonomous listen→act→listen loops, dynamic coworker
+  discovery, peer-to-peer messaging, broadcast, round-robin
+  distribution, wayward agent recovery, stale FIFO detection, and
+  zombie process cleanup. Validated through 3+ live simulations
+  (publishing house, Star Trek bridge, restaurant kitchen brigade).
+
+### Changed
+
+- **README** now documents the actor skill and its location.
+
 ## [0.5.0] — 2026-07-26
 
 ### Added

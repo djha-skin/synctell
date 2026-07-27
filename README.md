@@ -21,6 +21,47 @@ is listening for a message.
 cargo install synctell
 ```
 
+## Actor Skill (Multi-Agent AI Framework)
+
+`synctell` ships with an **Actor skill** for building multi-agent
+work networks with AI agents. Located at:
+
+```
+.agents/skills/actor/SKILL.md
+```
+
+### What it does
+
+The actor skill lets AI agents communicate through FIFO mailboxes in a
+`ai/agents/` directory. Each agent (actor) has a personal inbox FIFO
+and runs a listen→act→listen loop:
+
+1. Create mailbox directory + start linger reader on `inbox.fifo`
+2. Listen for messages (blocks until work arrives)
+3. Perform work (write files, process data, etc.)
+4. Signal completion to peers
+5. Loop back to listening
+
+### Orchestration patterns
+
+| Pattern | Description |
+|---------|-------------|
+| **Peer-to-peer** | Actors write directly to each other's inboxes |
+| **Broadcast** | One message fanned out to all actors simultaneously |
+| **Round-robin** | Work items distributed evenly across workers |
+
+### Key gotchas (from live validation)
+
+- Delegates cannot `load_skill()` — embed the actor protocol in instructions
+- Coordinators must poll for coworker FIFOs (200s timeout) before writing
+- Use `max_turns` >= 150 for long-lived actors
+- Pass file paths or content, not just status messages
+- Clean stale FIFOs (`.stale`, `.old`) before re-launching
+- Check for zombie processes after cancellations
+
+See the [full skill file](.agents/skills/actor/SKILL.md) for complete
+documentation and protocol.
+
 ## Commands
 
 | Command       | Description |
